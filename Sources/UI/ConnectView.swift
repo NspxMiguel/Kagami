@@ -82,6 +82,14 @@ struct ConnectView: View {
             openWindow(id: WindowID.screen)
             dismissWindow(id: WindowID.setup)
         }
+        .onAppear {
+            // A manual-verification hook, not a feature: `-autoConnect YES` lets a
+            // launch (simctl, a UI test) skip the tap and confirm the pipeline against
+            // a real console without driving the simulator's UI at all.
+            if UserDefaults.standard.bool(forKey: "autoConnect"), !session.host.isEmpty {
+                session.connect()
+            }
+        }
     }
 
     /// What has to be set up on the console. Three lines, in order, no wiki.

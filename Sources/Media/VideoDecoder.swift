@@ -5,34 +5,62 @@ import Observation
 import OSLog
 import VideoToolbox
 
-/// Turns the console's H.264 into frames the headset can draw.
-///
-/// The Switch encodes 720p30 in hardware and hands SysDVR raw Annex-B. VideoToolbox on
-/// the M2 decodes that in hardware too, so this whole path costs almost nothing — the
-/// expensive part of the pipeline is the network, not the decode.
+/// The decoded picture, published for SwiftUI. Deliberately thin: everything expensive
+/// lives in `H264Decoder`, off the main actor, and only ever reaches here as a finished
+/// `CVPixelBuffer` — this class exists so the view has something cheap to observe.
 @MainActor
 @Observable
-final class VideoDecoder {
-    /// The most recent frame. The view observes this and redraws.
+final class DecodedVideo {
     private(set) var frame: CVPixelBuffer?
     private(set) var framesDecoded = 0
-    /// True until the first keyframe lands. Decoding a P-frame without its reference
-    /// produces green mush, so the stream is deliberately silent until then.
-    private(set) var waitingForKeyframe = true
 
+    fileprivate func publish(_ buffer: CVPixelBuffer) {
+        frame = buffer
+        framesDecoded += 1
+    }
+
+    func reset() {
+        frame = nil
+        framesDecoded = 0
+    }
+}
+
+/// Turns the console's H.264 into frames the headset can draw.
+///
+/// This is an `actor`, not `@MainActor`, on purpose: Annex-B parsing and building the
+/// `CMSampleBuffer` for each frame is real CPU work, measured at 10-16ms per frame on a
+/// busy scene — over a third of the 33ms budget a 30fps stream allows. Running that on
+/// the main actor put it in direct competition with SwiftUI and RealityKit's own
+/// per-frame work; the two only had to collide occasionally to fall behind, and once
+/// behind, packets queued up and the receive loop could never catch back up — measured
+/// as a frame rate that decayed over tens of seconds even though the console kept
+/// sending a rock-steady 30 packets/sec the whole time (confirmed by reading the wire
+/// protocol directly, bypassing this app entirely). Hardware decode itself is not the
+/// bottleneck — the M-series video block barely notices 720p30 — the setup work around
+/// it was, and it only had to run somewhere other than the render thread to stop
+/// costing frames.
+actor H264Decoder {
     private let log = Logger(subsystem: "com.kagami.app", category: "decoder")
+    private let output: DecodedVideo
+
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
     private var parameterSets: [Data] = []
+    /// True until the first keyframe lands. Decoding a P-frame without its reference
+    /// produces green mush, so the stream is deliberately silent until then.
+    private var waitingForKeyframe = true
+
+    init(output: DecodedVideo) {
+        self.output = output
+    }
 
     func reset() {
         if let session { VTDecompressionSessionInvalidate(session) }
         session = nil
         format = nil
         parameterSets = []
-        frame = nil
-        framesDecoded = 0
         waitingForKeyframe = true
+        Task { @MainActor in output.reset() }
     }
 
     /// Feeds one access unit straight off the wire.
@@ -75,20 +103,17 @@ final class VideoDecoder {
             sampleBufferOut: &sample)
         guard sampleStatus == noErr, let sample else { return }
 
+        let output = self.output
         VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
             flags: [._EnableAsynchronousDecompression], infoFlagsOut: nil
-        ) { [weak self] status, _, image, _, _ in
+        ) { status, _, image, _, _ in
             guard status == noErr, let image else { return }
-            // VideoToolbox calls back off the main actor and CVImageBuffer is not
-            // Sendable. The box carries it across: the buffer leaves the decoder
-            // finished and is only ever read from here on — the drawing side never
-            // writes to it.
+            // VideoToolbox calls back off the actor and CVImageBuffer is not Sendable.
+            // The box carries it across: the buffer leaves the decoder finished and is
+            // only ever read from here on — the drawing side never writes to it.
             let ready = DecodedFrame(buffer: image)
-            Task { @MainActor in
-                self?.frame = ready.buffer
-                self?.framesDecoded += 1
-            }
+            Task { @MainActor in output.publish(ready.buffer) }
         }
     }
 
@@ -144,8 +169,8 @@ final class VideoDecoder {
     }
 }
 
-/// Carries a `CVPixelBuffer` from the VideoToolbox callback to the main actor.
-/// `@unchecked` is the discipline described at the use site: read-only from here.
+/// Carries a `CVPixelBuffer` off the actor. `@unchecked` is the discipline described at
+/// the use site: read-only from here on.
 private struct DecodedFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer
 }

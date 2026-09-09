@@ -23,7 +23,8 @@ final class Session {
     private let log = Logger(subsystem: "com.kagami.app", category: "session")
 
     var state: State = .idle
-    let decoder = VideoDecoder()
+    let decoder = DecodedVideo()
+    private var worker: H264Decoder?
 
     /// Where the console is. Remembered between launches, because it does not move.
     var host: String {
@@ -71,9 +72,15 @@ final class Session {
         guard !target.isEmpty else { return }
 
         state = .connecting
+        // A fresh worker per connection, rather than reusing one: it starts with no
+        // session and no parameter sets, which is exactly the state a reset would have
+        // produced anyway, and it sidesteps ever touching a VTDecompressionSession
+        // that a just-cancelled decode call might still be inside.
+        let worker = H264Decoder(output: decoder)
+        self.worker = worker
         decoder.reset()
 
-        videoTask = Task { await self.runVideo(host: target) }
+        videoTask = Task { await self.runVideo(host: target, worker: worker) }
         if playAudio {
             audio = AudioOutput()
             audio?.start()
@@ -87,6 +94,8 @@ final class Session {
         audioTask?.cancel(); audioTask = nil
         watchdog?.cancel(); watchdog = nil
         audio?.stop(); audio = nil
+        if let worker { Task { await worker.reset() } }
+        worker = nil
         decoder.reset()
         framesPerSecond = 0
         state = .idle
@@ -94,41 +103,58 @@ final class Session {
 
     // MARK: - Streams
 
-    private func runVideo(host: String) async {
-        let stream = SysDVRStream(host: host, kind: .video,
-                                  turnOffConsoleScreen: turnOffConsoleScreen)
+    /// `nonisolated` is load-bearing, not decoration. `Session` is `@MainActor`, so a
+    /// plain method here would run this entire loop — including resuming after every
+    /// `await` — on the main actor. Moving `decode()` to its own actor still left the
+    /// *loop* itself gated on the main actor being free to resume it, and the main
+    /// actor is also where SwiftUI and RealityKit do their own per-frame work. Under
+    /// real network conditions (bursty Wi-Fi, not the steady drip a loopback test
+    /// gives you) that contention was enough to make packets pile up in the socket
+    /// buffer faster than the loop drained them — measured as a frame rate that decayed
+    /// over tens of seconds against a real console, while a raw socket reading the same
+    /// stream held a rock-steady 30 packets/sec throughout. `nonisolated` lets this loop
+    /// run without waiting for the main actor at all; only the two-line state updates
+    /// below explicitly hop over to it, and a two-line hop clears even a busy queue
+    /// far faster than an ~8ms decode call ever could.
+    nonisolated private func runVideo(host: String, worker: H264Decoder) async {
+        let turnOffScreen = await turnOffConsoleScreen
+        let stream = SysDVRStream(host: host, kind: .video, turnOffConsoleScreen: turnOffScreen)
         do {
             try await stream.connect()
-            state = .waitingForGame
+            await MainActor.run { self.state = .waitingForGame }
 
             for try await packet in await stream.packets() {
                 if Task.isCancelled { break }
 
                 if packet.header.flags.contains(.error) {
-                    fail(SysDVR.describeError(packet.payload))
+                    let message = SysDVR.describeError(packet.payload)
+                    await MainActor.run { self.fail(message) }
                     break
                 }
                 guard !packet.payload.isEmpty else { continue }
 
-                decoder.decode(packet.payload, timestampNanos: packet.header.timestamp)
-                noteFrame()
+                await worker.decode(packet.payload, timestampNanos: packet.header.timestamp)
+                await MainActor.run { self.noteFrame() }
             }
         } catch is CancellationError {
             // Ordinary teardown.
         } catch {
-            fail(error.localizedDescription)
+            let message = error.localizedDescription
+            await MainActor.run { self.fail(message) }
         }
         await stream.close()
     }
 
-    private func runAudio(host: String) async {
+    /// Same reasoning as `runVideo`: PCM conversion is real per-packet work, and this
+    /// loop should not wait on the main actor to keep running.
+    nonisolated private func runAudio(host: String) async {
         let stream = SysDVRStream(host: host, kind: .audio)
         do {
             try await stream.connect()
             for try await packet in await stream.packets() {
                 if Task.isCancelled { break }
                 guard !packet.payload.isEmpty, !packet.header.flags.contains(.error) else { continue }
-                audio?.play(packet.payload)
+                await MainActor.run { self.audio?.play(packet.payload) }
             }
         } catch {
             // Audio failing on its own is not worth killing the picture over — plenty of
@@ -159,6 +185,7 @@ final class Session {
 
                 if state == .streaming, Date().timeIntervalSince(lastFrameAt) > 2 {
                     state = .waitingForGame
+                    if let worker { Task { await worker.reset() } }
                     decoder.reset()
                 }
             }
