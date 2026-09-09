@@ -1,0 +1,41 @@
+name: Kagami
+options:
+  bundleIdPrefix: com.kagami
+  deploymentTarget:
+    visionOS: "26.0"
+  createIntermediateGroups: true
+
+targets:
+  Kagami:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kagami.app
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.2"
+        SWIFT_STRICT_CONCURRENCY: complete
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kagami
+        # Reaching the console is the whole app, and visionOS refuses the connection
+        # outright without this string.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Kagami connects to your console on the local network to show its screen."
+        DEVELOPMENT_ASSET_PATHS: ""
+
+  KagamiUITests:
+    type: bundle.ui-testing
+    platform: visionOS
+    sources:
+      - path: Tests/KagamiUITests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kagami.app.uitests
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: Kagami
