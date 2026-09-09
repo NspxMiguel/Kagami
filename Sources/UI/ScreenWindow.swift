@@ -23,6 +23,14 @@ struct ScreenWindow: View {
                     dismissWindow(id: WindowID.screen)
                 }
             }
+            .task {
+                // Same manual-verification hook as `-autoConnect`: lets the theater
+                // light be checked with a screenshot, with nothing driving the UI.
+                if UserDefaults.standard.bool(forKey: "autoTheater") {
+                    theaterOpen = true
+                    _ = await openSpace(id: WindowID.theater)
+                }
+            }
     }
 
     private var controls: some View {

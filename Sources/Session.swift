@@ -26,6 +26,15 @@ final class Session {
     let decoder = DecodedVideo()
     private var worker: H264Decoder?
 
+    /// The colour `ConsoleScreen` is currently bleeding past its own edges, as raw
+    /// components rather than a SwiftUI `Color` — it is `TheaterSpace`'s RealityKit
+    /// material that reads this, and that has no use for round-tripping through `Color`
+    /// to get three numbers back out. Shared here, rather than kept as the screen's own
+    /// `@State`, because the theater is a separate scene with no other way to see it —
+    /// without this, dimming the room just goes to a flat black with no relation to
+    /// what is actually on screen.
+    var ambientComponents: (r: Double, g: Double, b: Double) = (0, 0, 0)
+
     /// Where the console is. Remembered between launches, because it does not move.
     var host: String {
         didSet { UserDefaults.standard.set(host, forKey: "console.host") }
@@ -98,6 +107,7 @@ final class Session {
         worker = nil
         decoder.reset()
         framesPerSecond = 0
+        ambientComponents = (0, 0, 0)
         state = .idle
     }
 

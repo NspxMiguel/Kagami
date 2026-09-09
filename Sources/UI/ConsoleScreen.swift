@@ -36,7 +36,10 @@ struct ConsoleScreen: View {
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fit)
                 .onChange(of: session.decoder.framesDecoded) {
-                    if ambient.sample(frame) { glow = ambient.colour }
+                    if ambient.sample(frame) {
+                        glow = ambient.colour
+                        session.ambientComponents = ambient.components
+                    }
                 }
         } else {
             Color.black

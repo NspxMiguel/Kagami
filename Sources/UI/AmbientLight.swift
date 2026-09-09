@@ -19,6 +19,9 @@ final class AmbientLight {
     private let interval: TimeInterval = 0.2
 
     private(set) var colour: Color = .clear
+    /// The same colour as raw linear components, for RealityKit material code that has
+    /// no reason to round-trip through a SwiftUI `Color` to get three numbers back out.
+    private(set) var components: (r: Double, g: Double, b: Double) = (0, 0, 0)
 
     /// Returns true when the colour changed and the view should animate to it.
     @discardableResult
@@ -44,11 +47,13 @@ final class AmbientLight {
         let peak = max(raw.r, max(raw.g, raw.b))
         guard peak > 0.02 else {
             colour = .clear
+            components = (0, 0, 0)
             return true
         }
         let lift = min(1.0, 0.55 / max(peak, 0.08))
 
-        colour = Color(red: min(1, raw.r * lift), green: min(1, raw.g * lift), blue: min(1, raw.b * lift))
+        components = (min(1, raw.r * lift), min(1, raw.g * lift), min(1, raw.b * lift))
+        colour = Color(red: components.r, green: components.g, blue: components.b)
         return true
     }
 }

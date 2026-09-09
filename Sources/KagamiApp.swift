@@ -30,6 +30,7 @@ struct KagamiApp: App {
 
         ImmersiveSpace(id: WindowID.theater) {
             TheaterSpace()
+                .environment(session)
         }
         .immersionStyle(selection: .constant(.progressive), in: .progressive, .full)
     }
