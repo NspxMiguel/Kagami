@@ -65,19 +65,19 @@ actor H264Decoder {
 
     /// Feeds one access unit straight off the wire.
     func decode(_ accessUnit: Data, timestampNanos: UInt64) {
-        // SysDVR is asked to inject SPS/PPS ahead of every keyframe, so they arrive
-        // glued to the picture and have to be peeled off before anything else.
-        let (sets, picture) = AnnexB.separateParameterSets(accessUnit)
-        if !sets.isEmpty, sets != parameterSets {
-            parameterSets = sets
+        // One pass over the buffer does all of it: pulls out SPS/PPS (glued to every
+        // keyframe because SysDVR is asked to inject them), notices whether this is a
+        // keyframe, and leaves the picture already length-prefixed for VideoToolbox.
+        let parsed = AnnexB.parse(accessUnit)
+        if !parsed.parameterSets.isEmpty, parsed.parameterSets != parameterSets {
+            parameterSets = parsed.parameterSets
             rebuildSession()
         }
 
-        if AnnexB.containsKeyframe(accessUnit) { waitingForKeyframe = false }
-        guard !waitingForKeyframe, let session, let format, !picture.isEmpty else { return }
+        if parsed.isKeyframe { waitingForKeyframe = false }
+        guard !waitingForKeyframe, let session, let format, !parsed.lengthPrefixedPicture.isEmpty else { return }
 
-        var block = AnnexB.toLengthPrefixed(picture)
-        guard !block.isEmpty else { return }
+        var block = parsed.lengthPrefixedPicture
         var length = block.count
 
         var blockBuffer: CMBlockBuffer?

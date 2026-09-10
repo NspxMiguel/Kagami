@@ -15,20 +15,42 @@ enum AnnexB {
         static let idr: UInt8 = 5
         static let sps: UInt8 = 7
         static let pps: UInt8 = 8
-
-        static func of(_ nal: Data) -> UInt8 {
-            guard let first = nal.first else { return 0 }
-            return first & 0x1F
-        }
     }
 
-    /// Splits an Annex-B stream into NAL units, start codes removed.
-    static func split(_ data: Data) -> [Data] {
-        let bytes = [UInt8](data)
-        guard bytes.count >= 3 else { return [] }
+    /// Everything `H264Decoder` needs from one access unit, produced by a single pass
+    /// over it.
+    struct ParsedAccessUnit {
+        /// SPS/PPS units, header intact, start codes stripped — what
+        /// `CMVideoFormatDescriptionCreateFromH264ParameterSets` wants.
+        var parameterSets: [Data] = []
+        /// True when this access unit can start a decode session on its own.
+        var isKeyframe = false
+        /// The picture data alone (parameter sets excluded), already length-prefixed —
+        /// what `CMBlockBufferCreateWithMemoryBlock` wants. Ready to hand to
+        /// VideoToolbox with no further conversion.
+        var lengthPrefixedPicture = Data()
+    }
 
-        // Find where each start code begins and ends first, so the payload can be cut
-        // as the span between one start code's end and the next one's beginning.
+    /// Splits an access unit into NAL units and sorts them in the same pass, building
+    /// the length-prefixed picture buffer directly rather than re-joining into Annex-B
+    /// first and re-splitting it a moment later.
+    ///
+    /// This used to be four separate passes over the buffer — `separateParameterSets`
+    /// splitting once, `containsKeyframe` splitting the same bytes again just to check
+    /// one bit, and `toLengthPrefixed` splitting a *third* time after `join` had spent a
+    /// pass rebuilding Annex-B purely so there would be something to split again. On a
+    /// 140 KB keyframe — an ordinary size for a busy scene — that was pure overhead the
+    /// Mac never felt and the headset's weaker chip did: measured on a real console,
+    /// busy scenes in Zelda dropped the actually-decoded frame rate to single digits.
+    /// One pass, one set of copies.
+    static func parse(_ data: Data) -> ParsedAccessUnit {
+        var result = ParsedAccessUnit()
+        let bytes = [UInt8](data)
+        guard bytes.count >= 3 else { return result }
+        result.lengthPrefixedPicture.reserveCapacity(bytes.count)
+
+        // Find where each start code begins and ends first, so a unit can be cut as the
+        // span between one start code's end and the next one's beginning.
         var marks: [(payload: Int, code: Int)] = []
         var i = 0
         while i + 2 < bytes.count {
@@ -43,55 +65,21 @@ enum AnnexB {
             i += 1
         }
 
-        var units: [Data] = []
         for (n, mark) in marks.enumerated() {
             let end = n + 1 < marks.count ? marks[n + 1].code : bytes.count
             guard end > mark.payload else { continue }
-            units.append(Data(bytes[mark.payload..<end]))
-        }
-        return units
-    }
+            let nalType = bytes[mark.payload] & 0x1F
 
-    /// Annex-B to length-prefixed, which is what VideoToolbox consumes.
-    static func toLengthPrefixed(_ data: Data) -> Data {
-        var out = Data(capacity: data.count)
-        for unit in split(data) {
-            out.append(littleEndian: UInt32(unit.count).bigEndian)
-            out.append(unit)
-        }
-        return out
-    }
-
-    /// Pulls SPS and PPS out of a frame, returning them alongside the picture data.
-    ///
-    /// SysDVR is asked to inject parameter sets on every keyframe, so this runs on each
-    /// one. Returning the remainder rather than the whole buffer matters: feeding SPS
-    /// back into the decoder as if it were a picture makes VideoToolbox fail the frame.
-    static func separateParameterSets(_ data: Data) -> (sets: [Data], picture: Data) {
-        var sets: [Data] = []
-        var picture: [Data] = []
-
-        for unit in split(data) {
-            switch NALType.of(unit) {
-            case NALType.sps, NALType.pps: sets.append(unit)
-            default: picture.append(unit)
+            switch nalType {
+            case NALType.sps, NALType.pps:
+                result.parameterSets.append(Data(bytes[mark.payload..<end]))
+            default:
+                if nalType == NALType.idr { result.isKeyframe = true }
+                let length = end - mark.payload
+                withUnsafeBytes(of: UInt32(length).bigEndian) { result.lengthPrefixedPicture.append(contentsOf: $0) }
+                result.lengthPrefixedPicture.append(contentsOf: bytes[mark.payload..<end])
             }
         }
-        return (sets, join(picture))
-    }
-
-    /// True when this access unit can start a decode session on its own.
-    static func containsKeyframe(_ data: Data) -> Bool {
-        split(data).contains { NALType.of($0) == NALType.idr }
-    }
-
-    /// Joins NAL units back into an Annex-B stream, 4-byte start code on each.
-    static func join(_ units: [Data]) -> Data {
-        var out = Data()
-        for unit in units {
-            out.append(contentsOf: [0, 0, 0, 1])
-            out.append(unit)
-        }
-        return out
+        return result
     }
 }

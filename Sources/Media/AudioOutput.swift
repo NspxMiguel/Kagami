@@ -6,7 +6,12 @@ import OSLog
 ///
 /// Kept deliberately shallow. Anything that buffers generously here would drift away
 /// from the picture, and audio arriving late is worse than audio arriving thin.
-final class AudioOutput {
+/// `@unchecked` because `start()`/`stop()` run on the main actor while `play()` is
+/// meant to be called from `Session.runAudio`'s own loop instead — the whole point of
+/// grabbing this instance once, off the main actor. `scheduled`, the only state the two
+/// sides share, is behind `lock`; nothing else here is touched from more than one place
+/// at a time.
+final class AudioOutput: @unchecked Sendable {
     private let log = Logger(subsystem: "com.kagami.app", category: "audio")
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()

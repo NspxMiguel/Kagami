@@ -155,16 +155,24 @@ final class Session {
         await stream.close()
     }
 
-    /// Same reasoning as `runVideo`: PCM conversion is real per-packet work, and this
-    /// loop should not wait on the main actor to keep running.
+    /// Same reasoning as `runVideo`, plus one more thing this fixed that `runVideo`
+    /// didn't: hopping to the main actor for every single audio packet — 40+ times a
+    /// second — meant audio scheduling queued up behind whatever the main actor was
+    /// doing for video (CGImage conversion, SwiftUI compositing, the theater's RealityKit
+    /// update), which is exactly why audio lagged in lockstep with the picture instead
+    /// of running independently the way two separate network connections should let it.
+    /// `AudioOutput` is a plain class with its own internal locking, not `@MainActor` —
+    /// grabbing it once, up front, means every `play()` call after that runs with no
+    /// actor hop at all.
     nonisolated private func runAudio(host: String) async {
         let stream = SysDVRStream(host: host, kind: .audio)
+        let output = await audio
         do {
             try await stream.connect()
             for try await packet in await stream.packets() {
                 if Task.isCancelled { break }
                 guard !packet.payload.isEmpty, !packet.header.flags.contains(.error) else { continue }
-                await MainActor.run { self.audio?.play(packet.payload) }
+                output?.play(packet.payload)
             }
         } catch {
             // Audio failing on its own is not worth killing the picture over — plenty of
