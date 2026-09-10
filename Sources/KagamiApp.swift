@@ -32,6 +32,11 @@ struct KagamiApp: App {
             TheaterSpace()
                 .environment(session)
         }
-        .immersionStyle(selection: .constant(.progressive), in: .progressive, .full)
+        // `.progressive` ties how dark the room gets to the Digital Crown — open the
+        // space and nothing visibly changes until someone turns it, which from a tap on
+        // the in-app toggle looks exactly like the room being stuck. `.full` makes the
+        // toggle itself the dial: tap it, the room goes dark immediately, no crown
+        // involved.
+        .immersionStyle(selection: .constant(.full), in: .full)
     }
 }
