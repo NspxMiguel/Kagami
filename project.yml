@@ -15,6 +15,10 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kagami.app
         CODE_SIGN_STYLE: Automatic
+        # His own personal account (miguel@keepok.com.br) has no session in Xcode
+        # right now — the dad's org team is what's actually signed in and working
+        # as of this build. Switch back once the personal account logs in again.
+        DEVELOPMENT_TEAM: SW36PU2B3T
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.2"
