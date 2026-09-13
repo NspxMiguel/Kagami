@@ -153,31 +153,69 @@ actor H264Decoder {
         }
     }
 
+    /// The result of one `VTDecompressionSessionDecodeFrame` call, distinguishing a
+    /// synchronous rejection (no callback will ever follow) from a callback that never
+    /// arrived in time (which may still be outstanding). That distinction is exactly
+    /// what decides whether `submit` may safely resubmit the same sample.
+    enum DecodeOutcome: Equatable {
+        case success
+        /// Either the decode call itself returned a non-`noErr` status, or its callback
+        /// already fired (in time) with a non-`noErr` status. Either way, no completion
+        /// for this submission is still pending, so the sample can be resubmitted.
+        case rejectedSynchronously(OSStatus)
+        /// The call was accepted (`noErr`) but its completion callback did not fire
+        /// within the timeout. VideoToolbox may still be holding this exact submission
+        /// — resubmitting it now would risk decoding the same access unit twice
+        /// concurrently in the same stateful session, corrupting the reference chain
+        /// or yielding a duplicate/stale frame. Always a hard failure, never retried.
+        case timedOut
+    }
+
+    /// Whether a first attempt's outcome may be retried without the do-not-output hint.
+    /// Pulled out as a pure function so the one rule that matters here — a timeout is
+    /// never retried, only a genuine synchronous rejection is — can be tested without a
+    /// real VideoToolbox session.
+    static func shouldRetryWithoutHint(after first: DecodeOutcome, suppressOutput: Bool) -> Bool {
+        guard suppressOutput, case .rejectedSynchronously = first else { return false }
+        return true
+    }
+
     /// Submits one sample to VideoToolbox, with the do-not-output hint when the pipeline
     /// is behind the live edge. `kVTDecodeFrame_DoNotOutputFrame` is documented as a
     /// hint, not a guarantee, so a decoder that refuses it is a real possibility this
     /// falls back for: retry the same sample without the hint (still under 2 ms per the
     /// measured decode cost) rather than treating a hint-related failure as a broken
-    /// reference chain and forcing an unnecessary keyframe wait.
+    /// reference chain and forcing an unnecessary keyframe wait. That retry only ever
+    /// happens on a *synchronous* rejection (see `shouldRetryWithoutHint`) — never after
+    /// a timeout, since the original call could still be in flight then.
     private func submit(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         suppressOutput: Bool
     ) throws {
-        var result = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: suppressOutput)
-        if suppressOutput, result != noErr {
+        let first = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: suppressOutput)
+        let outcome: DecodeOutcome
+        if Self.shouldRetryWithoutHint(after: first, suppressOutput: suppressOutput) {
             log.notice("VideoToolbox rejected kVTDecodeFrame_DoNotOutputFrame; falling back to a normal decode")
-            result = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
+            outcome = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
+        } else {
+            outcome = first
         }
-        guard result == noErr else {
+        switch outcome {
+        case .success:
+            return
+        case .rejectedSynchronously(let status):
             enterKeyframeWait()
-            throw DecodeFailure(status: result)
+            throw DecodeFailure(status: status)
+        case .timedOut:
+            enterKeyframeWait()
+            throw DecodeFailure(status: kVTVideoDecoderMalfunctionErr)
         }
     }
 
     private func attemptDecode(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         doNotOutput: Bool
-    ) -> OSStatus {
+    ) -> DecodeOutcome {
         let continuation = self.continuation
         let stats = self.stats
         let callbackStatus = Mutex<OSStatus>(noErr)
@@ -206,15 +244,22 @@ actor H264Decoder {
             }
             done.signal()
         }
-        guard status == noErr else { return status }
+        // A non-noErr return here means VideoToolbox rejected the submission outright —
+        // per Apple's documented contract for VTDecompressionSessionDecodeFrame, the
+        // callback fires if and only if the frame was accepted (status == noErr from
+        // this call), so no callback will ever follow and there is nothing pending.
+        guard status == noErr else { return .rejectedSynchronously(status) }
         // Bounded well above the ~2 ms measured decode cost and the 33 ms frame budget,
         // so a genuinely wedged decoder cannot hang this actor forever — it is treated
-        // as a decode error (a real one, since nothing decoded) instead.
+        // as a decode error (a real one, since nothing decoded). Unlike the synchronous
+        // rejection above, the accepted submission's callback may still fire later, so
+        // this case must never be treated as safe to resubmit.
         if done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
             log.error("VideoToolbox decode callback did not fire within 200ms")
-            return kVTVideoDecoderMalfunctionErr
+            return .timedOut
         }
-        return callbackStatus.withLock { $0 }
+        let final = callbackStatus.withLock { $0 }
+        return final == noErr ? .success : .rejectedSynchronously(final)
     }
 
     private func enterKeyframeWait() {

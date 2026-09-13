@@ -1,6 +1,7 @@
 import CoreVideo
 import Foundation
 import Network
+import VideoToolbox
 import XCTest
 
 @testable import KagamiCore
@@ -202,6 +203,26 @@ final class StreamingTests: XCTestCase, @unchecked Sendable {
         var count = 0
         for await _ in decoder.frames { count += 1 }
         XCTAssertTrue(count == 1)
+    }
+
+    /// The do-not-output fallback may only fire on a synchronous rejection, where
+    /// VideoToolbox's own contract guarantees no callback is still pending for the
+    /// first submission. A timeout carries no such guarantee — the original call could
+    /// still complete later — so resubmitting the same sample then would risk decoding
+    /// one access unit twice concurrently inside the same stateful session.
+    func testRetryWithoutHintOnlyFollowsASynchronousRejection() {
+        XCTAssertTrue(
+            H264Decoder.shouldRetryWithoutHint(
+                after: .rejectedSynchronously(kVTVideoDecoderMalfunctionErr), suppressOutput: true))
+        XCTAssertFalse(
+            H264Decoder.shouldRetryWithoutHint(after: .timedOut, suppressOutput: true))
+        XCTAssertFalse(
+            H264Decoder.shouldRetryWithoutHint(after: .success, suppressOutput: true))
+        // The hint was never sent in the first place, so there is nothing to fall back
+        // from regardless of how the plain decode came out.
+        XCTAssertFalse(
+            H264Decoder.shouldRetryWithoutHint(
+                after: .rejectedSynchronously(kVTVideoDecoderMalfunctionErr), suppressOutput: false))
     }
 
     /// A stall well under the read-idle timeout must never tear down the connection —
