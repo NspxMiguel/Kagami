@@ -10,7 +10,7 @@ struct ConsoleScreen: View {
 
     var body: some View {
         ZStack {
-            picture
+            VideoSurface(video: session.decoder)
             overlay
         }
         .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -26,23 +26,20 @@ struct ConsoleScreen: View {
                 .allowsHitTesting(false)
         }
         .animation(Design.Motion.ambient, value: glow)
-    }
-
-    @ViewBuilder
-    private var picture: some View {
-        if let frame = session.decoder.frame {
-            Image(decorative: cgImage(from: frame), scale: 1)
-                .resizable()
-                .interpolation(.high)
-                .aspectRatio(contentMode: .fit)
-                .onChange(of: session.decoder.framesDecoded) {
-                    if ambient.sample(frame) {
-                        glow = ambient.colour
-                        session.ambientComponents = ambient.components
+        .task {
+            while !Task.isCancelled {
+                if session.state == .streaming, let frame = session.decoder.frame {
+                    if let components = await ambient.sample(DecodedFrame(buffer: frame)),
+                        !Task.isCancelled, session.state == .streaming
+                    {
+                        glow = Color(red: components.r, green: components.g, blue: components.b)
+                        session.ambientComponents = components
                     }
+                } else {
+                    glow = .clear
                 }
-        } else {
-            Color.black
+                do { try await Task.sleep(for: .milliseconds(220)) } catch { return }
+            }
         }
     }
 
@@ -56,6 +53,14 @@ struct ConsoleScreen: View {
                    title: String(localized: "Reaching the console"),
                    detail: String(localized: "Make sure SysDVR is running in TCP mode."),
                    spinning: true)
+
+        case .reconnecting:
+            status(
+                icon: "antenna.radiowaves.left.and.right",
+                title: String(localized: "Reconnecting to the console"),
+                detail: String(
+                    localized: "Keep the console awake. The picture will return automatically."),
+                spinning: true)
 
         case .waitingForGame:
             status(icon: "gamecontroller",
@@ -96,16 +101,4 @@ struct ConsoleScreen: View {
         .background(.black.opacity(0.75))
     }
 
-    private func cgImage(from buffer: CVPixelBuffer) -> CGImage {
-        var image: CGImage?
-        VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &image)
-        return image ?? Self.blank
-    }
-
-    private static let blank: CGImage = {
-        let context = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8,
-                                bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
-                                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue)!
-        return context.makeImage()!
-    }()
 }

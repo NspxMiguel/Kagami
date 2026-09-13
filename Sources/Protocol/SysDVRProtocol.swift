@@ -146,6 +146,7 @@ enum SysDVR {
         static let magic: UInt32 = 0xCCCC_CCCC
 
         var dataSize: Int
+        /// Console monotonic time in microseconds, as defined by capture.h.
         var timestamp: UInt64
         var flags: Flags
 

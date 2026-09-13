@@ -18,6 +18,8 @@ actor SysDVRStream {
     struct Packet: Sendable {
         let header: SysDVR.PacketHeader
         let payload: Data
+        var sequence = 0
+        let receivedAt = ContinuousClock.now
     }
 
     enum Failure: LocalizedError {
@@ -26,6 +28,8 @@ actor SysDVRStream {
         case rejected(UInt32)
         case desynchronised
         case closed
+        case timedOut
+        case excessiveLatency
 
         var errorDescription: String? {
             switch self {
@@ -40,16 +44,21 @@ actor SysDVRStream {
                 return String(localized: "The stream lost sync with the console.")
             case .closed:
                 return String(localized: "The console closed the connection.")
+            case .excessiveLatency:
+                return "Stream latency exceeded the recovery budget."
+            case .timedOut:
+                return String(
+                    localized: "The console did not respond. Check its address and Wi-Fi.")
             }
         }
     }
 
     private let log = Logger(subsystem: "com.kagami.app", category: "stream")
     private let kind: Kind
-    private let connection: NWConnection
+    private nonisolated let connection: NWConnection
     private var connected = false
 
-    init(host: String, kind: Kind, turnOffConsoleScreen: Bool = false) {
+    init(host: String, kind: Kind, turnOffConsoleScreen: Bool = false, port: UInt16? = nil) {
         self.kind = kind
         self.turnOffConsoleScreen = turnOffConsoleScreen
 
@@ -59,10 +68,14 @@ actor SysDVRStream {
         // on a stream that is already a third of a second behind the game.
         options.noDelay = true
         options.connectionTimeout = 5
+        options.enableKeepalive = true
+        options.keepaliveIdle = 5
+        options.keepaliveInterval = 2
+        options.keepaliveCount = 3
 
         connection = NWConnection(
             host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: kind.port)!,
+            port: NWEndpoint.Port(rawValue: port ?? kind.port)!,
             using: NWParameters(tls: nil, tcp: options))
     }
 
@@ -71,8 +84,16 @@ actor SysDVRStream {
     // MARK: - Connection
 
     func connect() async throws {
+        // TCP's timeout does not cover a peer that accepts but never handshakes.
+        let deadline = Task {
+            try await Task.sleep(for: .seconds(6))
+            connection.cancel()
+        }
+        defer { deadline.cancel() }
+        try Task.checkCancellation()
         try await openSocket()
         try await handshake()
+        try Task.checkCancellation()
         connected = true
     }
 
@@ -82,7 +103,9 @@ actor SysDVRStream {
     }
 
     private func openSocket() async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             // The handler fires on every transition and the continuation may only be
             // resumed once, so it disarms itself on the first decisive state.
             let box = ResumeOnce(cont)
@@ -95,6 +118,9 @@ actor SysDVRStream {
                 }
             }
             connection.start(queue: .global(qos: .userInitiated))
+            }
+        } onCancel: {
+            self.connection.cancel()
         }
     }
 
@@ -128,11 +154,16 @@ actor SysDVRStream {
 
     /// Reads packets until the connection ends or the task is cancelled.
     func packets() -> AsyncThrowingStream<Packet, Error> {
-        AsyncThrowingStream { continuation in
+        // Bounded compressed queues. Sequence gaps tell the decoder to wait for an
+        // IDR rather than displaying P-frames whose reference was discarded.
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(3)) { continuation in
             let task = Task {
+                var sequence = 0
                 do {
                     while !Task.isCancelled {
-                        let packet = try await readPacket()
+                        var packet = try await readPacket()
+                        packet.sequence = sequence
+                        sequence += 1
                         continuation.yield(packet)
                     }
                     continuation.finish()
@@ -140,7 +171,10 @@ actor SysDVRStream {
                     continuation.finish(throwing: error)
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            continuation.onTermination = { _ in
+                task.cancel()
+                self.connection.cancel()
+            }
         }
     }
 
@@ -158,16 +192,23 @@ actor SysDVRStream {
     // MARK: - Socket primitives
 
     private func send(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
                 if let error { cont.resume(throwing: error) } else { cont.resume() }
             })
+            }
+        } onCancel: {
+            self.connection.cancel()
         }
     }
 
     private func receiveExactly(_ count: Int) async throws -> Data {
         guard count > 0 else { return Data() }
-        return try await withCheckedThrowingContinuation { cont in
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { cont in
             connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
                 if let error { cont.resume(throwing: error); return }
                 guard let data, data.count == count else {
@@ -175,6 +216,9 @@ actor SysDVRStream {
                 }
                 cont.resume(returning: data)
             }
+            }
+        } onCancel: {
+            self.connection.cancel()
         }
     }
 }

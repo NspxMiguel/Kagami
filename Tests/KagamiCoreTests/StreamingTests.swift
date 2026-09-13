@@ -1,0 +1,251 @@
+import CoreVideo
+import Foundation
+import Network
+import XCTest
+
+@testable import KagamiCore
+
+final class StreamingTests: XCTestCase, @unchecked Sendable {
+    func testTimelineUsesMicrosecondsAndRecoversAfterBurst() {
+        var timeline = StreamTimeline()
+        let origin = ContinuousClock.now
+        XCTAssertEqual(timeline.excessDelay(timestampMicros: 9_000_000, receivedAt: origin), .zero)
+        XCTAssertEqual(
+            timeline.excessDelay(
+                timestampMicros: 9_100_000, receivedAt: origin.advanced(by: .milliseconds(100))),
+            .zero)
+        let delayed = timeline.excessDelay(
+            timestampMicros: 9_200_000, receivedAt: origin.advanced(by: .milliseconds(500)))
+        XCTAssertGreaterThan(delayed, .milliseconds(290))
+        XCTAssertEqual(
+            timeline.excessDelay(
+                timestampMicros: 9_500_000, receivedAt: origin.advanced(by: .milliseconds(500))),
+            .zero)
+        XCTAssertEqual(
+            timeline.excessDelay(timestampMicros: 0, receivedAt: origin.advanced(by: .seconds(1))),
+            .zero)
+    }
+
+    func testCancelsDuringHandshake() async throws {
+        let peer = try TestPeer(bytes: Data())
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        let task = Task { try await stream.connect() }
+        try await Task.sleep(for: .milliseconds(100))
+        let start = ContinuousClock.now
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Cancelled handshake succeeded")
+        } catch {}
+        XCTAssertTrue(start.duration(to: .now) < .seconds(1))
+        await stream.close()
+    }
+
+    func testSilentPeerHasHandshakeDeadline() async throws {
+        let peer = try TestPeer(bytes: Data())
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        let start = ContinuousClock.now
+        do {
+            try await stream.connect()
+            XCTFail("Silent peer connected")
+        } catch {}
+        XCTAssertTrue(start.duration(to: .now) < .seconds(8))
+        await stream.close()
+    }
+
+    func testBurstKeepsOnlyRecentPackets() async throws {
+        var bytes = TestPeer.handshake
+        for index in 0..<100 {
+            bytes.append(littleEndian: SysDVR.PacketHeader.magic)
+            bytes.append(littleEndian: UInt32(1))
+            bytes.append(littleEndian: UInt64(index * 33_333))
+            bytes.append(contentsOf: [1, 0, UInt8(index)])
+        }
+        let peer = try TestPeer(bytes: bytes)
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        try await stream.connect()
+        let packets = await stream.packets()
+        try await Task.sleep(for: .milliseconds(300))
+        var iterator = packets.makeAsyncIterator()
+        let first = try await iterator.next()
+        XCTAssertTrue(first?.sequence == 97)
+        XCTAssertTrue(first?.payload == Data([97]))
+        await stream.close()
+    }
+
+    func testCancelPendingReadAndConnectAgain() async throws {
+        let peer = try TestPeer(bytes: TestPeer.handshake)
+        let port = try await peer.start()
+        defer { peer.stop() }
+        for _ in 0..<3 {
+            let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+            try await stream.connect()
+            let task = Task {
+                for try await _ in await stream.packets() {}
+                await stream.close()
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            let start = ContinuousClock.now
+            task.cancel()
+            _ = await task.result
+            XCTAssertTrue(start.duration(to: .now) < .seconds(1))
+            await stream.close()
+        }
+    }
+
+    func testCorruptHeaderIsRejected() async throws {
+        let peer = try TestPeer(bytes: TestPeer.handshake + Data(repeating: 0, count: 18))
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        try await stream.connect()
+        do {
+            for try await _ in await stream.packets() { XCTFail("Accepted a corrupt packet") }
+            XCTFail("Corrupt stream ended without error")
+        } catch SysDVRStream.Failure.desynchronised {} catch { XCTFail(String(describing: error)) }
+        await stream.close()
+    }
+
+    func testDecoderSustainsThirtyFramesPerSecond() async throws {
+        let file = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "keyframe", withExtension: "h264", subdirectory: "Fixtures"))
+        let bytes = try Data(contentsOf: file)
+        let decoder = H264Decoder()
+        let receiver = Task {
+            var count = 0
+            for await frame in decoder.frames {
+                XCTAssertTrue(CVPixelBufferGetWidth(frame.buffer) == 1280)
+                XCTAssertTrue(CVPixelBufferGetHeight(frame.buffer) == 720)
+                count += 1
+            }
+            return count
+        }
+        let clock = ContinuousClock()
+        let start = clock.now
+        var durations: [Double] = []
+        for index in 0..<300 {
+            try await clock.sleep(
+                until: start.advanced(by: .nanoseconds(Int64(index) * 33_333_333)))
+            let before = clock.now
+            try await decoder.decode(bytes, timestampMicros: UInt64(index) * 33_333)
+            let duration = before.duration(to: clock.now)
+            durations.append(
+                Double(duration.components.attoseconds) / 1e15 + Double(duration.components.seconds)
+                    * 1000)
+        }
+        await decoder.finish()
+        let count = await receiver.value
+        XCTAssertTrue(count == 300)
+        let sorted = durations.sorted()
+        print(
+            "720p30: \(count)/300 decoded frames; decode p50=\(sorted[150])ms, p95=\(sorted[285])ms, max=\(sorted[299])ms"
+        )
+    }
+
+    func testDecoderAcceptsSeparateParameterSets() async throws {
+        let file = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "keyframe", withExtension: "h264", subdirectory: "Fixtures"))
+        let parsed = AnnexB.parse(try Data(contentsOf: file))
+        let decoder = H264Decoder()
+        for parameter in parsed.parameterSets {
+            try await decoder.decode(Data([0, 0, 0, 1]) + parameter, timestampMicros: 0)
+        }
+        var picture = Data()
+        var offset = 0
+        let bytes = parsed.lengthPrefixedPicture
+        while offset + 4 <= bytes.count {
+            let length = bytes.withUnsafeBytes {
+                Int(UInt32(bigEndian: $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            }
+            offset += 4
+            picture.append(contentsOf: [0, 0, 0, 1])
+            picture.append(bytes[offset..<offset + length])
+            offset += length
+        }
+        try await decoder.decode(picture, timestampMicros: 0)
+        await decoder.finish()
+        var count = 0
+        for await _ in decoder.frames { count += 1 }
+        XCTAssertEqual(count, 1)
+    }
+
+    func testDecoderWaitsForKeyframeAndBoundsOutput() async throws {
+        let file = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "keyframe", withExtension: "h264", subdirectory: "Fixtures"))
+        let keyframe = try Data(contentsOf: file)
+        let decoder = H264Decoder()
+        try await decoder.decode(Data([0, 0, 0, 1, 0x41, 0]), timestampMicros: 0)
+        for index in 0..<30 {
+            try await decoder.decode(keyframe, timestampMicros: UInt64(index) * 33_333)
+        }
+        await decoder.recoverAfterDrop()
+        try await decoder.decode(Data([0, 0, 0, 1, 0x41, 0]), timestampMicros: 1_000_000)
+        await decoder.finish()
+        var count = 0
+        for await _ in decoder.frames { count += 1 }
+        XCTAssertTrue(count == 1)
+    }
+}
+
+private final class TestPeer: @unchecked Sendable {
+    static var handshake: Data {
+        var data = Data("SysDVR|03\0".utf8)
+        data.append(littleEndian: UInt32(6))
+        data.append(Data(repeating: 0, count: 68))
+        return data
+    }
+
+    private let listener: NWListener
+    private let bytes: Data
+    private let lock = NSLock()
+    private var connections: [NWConnection] = []
+
+    init(bytes: Data) throws {
+        self.bytes = bytes
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        listener = try NWListener(using: parameters)
+    }
+
+    func start() async throws -> UInt16 {
+        listener.newConnectionHandler = { [self] connection in
+            lock.withLock { connections.append(connection) }
+            connection.start(queue: .global())
+            if !bytes.isEmpty {
+                connection.send(content: bytes, completion: .contentProcessed { _ in })
+            }
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { [self] state in
+                switch state {
+                case .ready:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(returning: listener.port!.rawValue)
+                case .failed(let error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            listener.start(queue: .global())
+        }
+    }
+
+    func stop() {
+        listener.cancel()
+        listener.newConnectionHandler = nil
+        lock.withLock {
+            connections.forEach { $0.cancel() }
+            connections.removeAll()
+        }
+    }
+}

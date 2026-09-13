@@ -1,0 +1,502 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "Console reported an error.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Console reported an error."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console informou um erro."
+          }
+        }
+      }
+    },
+    "The console rejected this protocol version. Update SysDVR on the Switch, or update Kagami.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console rejected this protocol version. Update SysDVR on the Switch, or update Kagami."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console recusou esta versão do protocolo. Atualize o SysDVR no Switch ou o Kagami."
+          }
+        }
+      }
+    },
+    "Something is listening on that port, but it is not SysDVR.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Something is listening on that port, but it is not SysDVR."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Há um serviço nessa porta, mas não é o SysDVR."
+          }
+        }
+      }
+    },
+    "The console closed the connection.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console closed the connection."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console encerrou a conexão."
+          }
+        }
+      }
+    },
+    "The console did not respond. Check its address and Wi-Fi.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console did not respond. Check its address and Wi-Fi."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console não respondeu. Confira o endereço e o Wi-Fi."
+          }
+        }
+      }
+    },
+    "The console refused the connection (code %u).": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console refused the connection (code %u)."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console recusou a conexão (código %u)."
+          }
+        }
+      }
+    },
+    "The console speaks SysDVR protocol %@, which Kagami does not know.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console speaks SysDVR protocol %@, which Kagami does not know."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console usa o protocolo SysDVR %@, que o Kagami não reconhece."
+          }
+        }
+      }
+    },
+    "The stream lost sync with the console.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The stream lost sync with the console."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A transmissão perdeu a sincronização com o console."
+          }
+        }
+      }
+    },
+    "Atmosphère, with SysDVR installed as a sysmodule.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Atmosphère, with SysDVR installed as a sysmodule."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Atmosphère com o SysDVR instalado como sysmodule."
+          }
+        }
+      }
+    },
+    "Blank the console screen while streaming": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Blank the console screen while streaming"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apagar a tela do console durante a transmissão"
+          }
+        }
+      }
+    },
+    "Both devices on the same network. Wired beats Wi-Fi.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Both devices on the same network. Wired beats Wi-Fi."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Os dois aparelhos na mesma rede. Prefira cabo no Switch."
+          }
+        }
+      }
+    },
+    "CONSOLE ADDRESS": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CONSOLE ADDRESS"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ENDEREÇO DO CONSOLE"
+          }
+        }
+      }
+    },
+    "Connect": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connect"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conectar"
+          }
+        }
+      }
+    },
+    "ON THE SWITCH": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ON THE SWITCH"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "NO SWITCH"
+          }
+        }
+      }
+    },
+    "On the console: System Settings › Internet, under the connected network.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "On the console: System Settings › Internet, under the connected network."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No console: Configurações do console › Internet, abaixo da rede conectada."
+          }
+        }
+      }
+    },
+    "Play console audio": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play console audio"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproduzir o áudio do console"
+          }
+        }
+      }
+    },
+    "SysDVR set to TCP Bridge mode, then reboot.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "SysDVR set to TCP Bridge mode, then reboot."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Configure o SysDVR no modo TCP Bridge e reinicie."
+          }
+        }
+      }
+    },
+    "Your Switch, on your face.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your Switch, on your face."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seu Switch, no Vision Pro."
+          }
+        }
+      }
+    },
+    "Keep the console awake. The picture will return automatically.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep the console awake. The picture will return automatically."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mantenha o console ligado. A imagem voltará automaticamente."
+          }
+        }
+      }
+    },
+    "Make sure SysDVR is running in TCP mode.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Make sure SysDVR is running in TCP mode."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Confira se o SysDVR está no modo TCP Bridge."
+          }
+        }
+      }
+    },
+    "Reaching the console": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reaching the console"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conectando ao console"
+          }
+        }
+      }
+    },
+    "Reconnecting to the console": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reconnecting to the console"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reconectando ao console"
+          }
+        }
+      }
+    },
+    "The console only shares its screen while a game is open — the HOME menu stays private.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The console only shares its screen while a game is open — the HOME menu stays private."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O console só transmite a tela com um jogo aberto. O menu HOME não é transmitido."
+          }
+        }
+      }
+    },
+    "The stream stopped": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The stream stopped"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A transmissão parou"
+          }
+        }
+      }
+    },
+    "Waiting for a game": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for a game"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aguardando um jogo"
+          }
+        }
+      }
+    },
+    "Could not dim the room": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not dim the room"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Não foi possível escurecer o ambiente"
+          }
+        }
+      }
+    },
+    "Dim the room": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dim the room"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escurecer o ambiente"
+          }
+        }
+      }
+    },
+    "Disconnect": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Disconnect"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Desconectar"
+          }
+        }
+      }
+    },
+    "OK": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        }
+      }
+    },
+    "Try again after closing other immersive experiences.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Try again after closing other immersive experiences."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tente novamente após fechar outras experiências imersivas."
+          }
+        }
+      }
+    },
+    "fps": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "fps"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "fps"
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

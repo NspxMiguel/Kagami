@@ -133,8 +133,10 @@ def recv_exactly(conn: socket.socket, count: int) -> bytes:
     return buffer
 
 
-def send_packet(conn: socket.socket, payload: bytes, flags: int, timestamp_ns: int) -> None:
-    header = struct.pack("<IiQBB", PACKET_MAGIC, len(payload), timestamp_ns, flags, 0)
+def send_packet(
+    conn: socket.socket, payload: bytes, flags: int, timestamp_us: int
+) -> None:
+    header = struct.pack("<IiQBB", PACKET_MAGIC, len(payload), timestamp_us, flags, 0)
     conn.sendall(header + payload)
 
 
@@ -178,7 +180,7 @@ def main() -> int:
         index = 0
         while True:
             frame = frames[index % len(frames)]
-            send_packet(conn, frame, FLAG_VIDEO, int(time.monotonic_ns()))
+            send_packet(conn, frame, FLAG_VIDEO, time.monotonic_ns() // 1000)
             index += 1
             # Pace against a fixed origin so the stream does not drift late.
             target = start + index / FPS
@@ -195,7 +197,7 @@ def main() -> int:
             if len(chunk) < AUDIO_PAYLOAD:
                 offset = 0
                 continue
-            send_packet(conn, chunk, FLAG_AUDIO, int(time.monotonic_ns()))
+            send_packet(conn, chunk, FLAG_AUDIO, time.monotonic_ns() // 1000)
             offset += AUDIO_PAYLOAD
             chunks += 1
             seconds_per_chunk = (AUDIO_PAYLOAD / (CHANNELS * 2)) / SAMPLE_RATE

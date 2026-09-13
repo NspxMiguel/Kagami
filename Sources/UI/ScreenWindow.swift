@@ -7,7 +7,7 @@ struct ScreenWindow: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openImmersiveSpace) private var openSpace
     @Environment(\.dismissImmersiveSpace) private var dismissSpace
-    @State private var theaterOpen = false
+    @State private var theaterError = false
 
     var body: some View {
         ConsoleScreen()
@@ -19,17 +19,28 @@ struct ScreenWindow: View {
                 // Losing the console should not leave an empty black pane floating in
                 // the room with no way back to the address field.
                 if !running {
-                    openWindow(id: WindowID.setup)
-                    dismissWindow(id: WindowID.screen)
+                    Task {
+                        if session.theaterOpen { await dismissSpace() }
+                        openWindow(id: WindowID.setup)
+                        dismissWindow(id: WindowID.screen)
+                    }
                 }
             }
             .task {
                 // Same manual-verification hook as `-autoConnect`: lets the theater
                 // light be checked with a screenshot, with nothing driving the UI.
                 if UserDefaults.standard.bool(forKey: "autoTheater") {
-                    theaterOpen = true
-                    _ = await openSpace(id: WindowID.theater)
+                    await setTheater(true)
                 }
+            }
+            .onDisappear {
+                if session.isRunning { session.disconnect() }
+                if session.theaterOpen { Task { await dismissSpace() } }
+            }
+            .alert(String(localized: "Could not dim the room"), isPresented: $theaterError) {
+                Button(String(localized: "OK"), role: .cancel) {}
+            } message: {
+                Text(String(localized: "Try again after closing other immersive experiences."))
             }
     }
 
@@ -40,22 +51,16 @@ struct ScreenWindow: View {
             Divider().frame(height: 22)
 
             Toggle(isOn: Binding(
-                get: { theaterOpen },
+                    get: { session.theaterOpen },
                 set: { wanted in
-                    theaterOpen = wanted
-                    Task {
-                        if wanted {
-                            _ = await openSpace(id: WindowID.theater)
-                        } else {
-                            await dismissSpace()
-                        }
-                    }
+                        Task { await setTheater(wanted) }
                 })) {
                     Label(String(localized: "Dim the room"), systemImage: "moon.stars")
                 }
                 .toggleStyle(.button)
                 .labelStyle(.iconOnly)
                 .help(String(localized: "Dim the room"))
+            .disabled(session.theaterTransitioning)
 
             Button(role: .destructive) {
                 session.disconnect()
@@ -71,9 +76,28 @@ struct ScreenWindow: View {
         .glassBackgroundEffect()
     }
 
-    /// A live frame counter, monospaced so it does not reflow on every digit. It is the
-    /// one honest readout of whether the network is keeping up: 30 is the ceiling the
-    /// console encodes at, and anything under 25 is felt before it is seen.
+    private func setTheater(_ wanted: Bool) async {
+        guard !session.theaterTransitioning else { return }
+        session.theaterTransitioning = true
+        defer { session.theaterTransitioning = false }
+        if wanted {
+            switch await openSpace(id: WindowID.theater) {
+            case .opened:
+                session.theaterOpen = true
+                if !session.isRunning { await dismissSpace() }
+            case .userCancelled: session.theaterOpen = false
+            case .error:
+                session.theaterOpen = false
+                theaterError = true
+            @unknown default: session.theaterOpen = false
+            }
+        } else {
+            await dismissSpace()
+            session.theaterOpen = false
+        }
+    }
+
+    /// Uses the video renderer's displayed-frame metrics, excluding dropped frames.
     private var frameRate: some View {
         HStack(spacing: 6) {
             Circle()

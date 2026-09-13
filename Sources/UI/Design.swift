@@ -8,6 +8,7 @@ enum Design {
     /// The one accent. Phosphor green-cyan: the colour of a console that is switched on,
     /// and nobody else's brand.
     static let accent = Color(red: 0.24, green: 0.88, blue: 0.82)
+    static let theaterBrightness = 0.18
 
     enum Radius {
         /// Anything you touch.

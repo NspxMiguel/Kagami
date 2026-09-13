@@ -27,12 +27,11 @@ final class ConnectFlowTests: XCTestCase {
         let fps = app.staticTexts["frameRateLabel"]
         XCTAssertTrue(fps.waitForExistence(timeout: 15), "the screen window never opened")
 
-        // Give the decoder a few seconds of real packets, then require a non-zero rate —
-        // that means SysDVRStream connected, handshook, and VideoToolbox decoded frames.
+        // Require the renderer's displayed-frame metric, not a packet counter.
         let deadline = Date().addingTimeInterval(15)
         var sawFrames = false
         while Date() < deadline {
-            if let value = fps.value as? String, let rate = Int(value), rate > 0 {
+            if let rate = Int(fps.label), rate > 0 {
                 sawFrames = true
                 break
             }

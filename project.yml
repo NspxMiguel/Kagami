@@ -43,3 +43,16 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
     dependencies:
       - target: Kagami
+
+schemes:
+  Kagami:
+    build:
+      targets:
+        Kagami: all
+    run:
+      config: Release
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - KagamiUITests

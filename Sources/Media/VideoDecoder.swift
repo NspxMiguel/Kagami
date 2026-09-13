@@ -1,47 +1,16 @@
 import CoreMedia
 import CoreVideo
 import Foundation
-import Observation
 import OSLog
+import Synchronization
 import VideoToolbox
 
-/// The decoded picture, published for SwiftUI. Deliberately thin: everything expensive
-/// lives in `H264Decoder`, off the main actor, and only ever reaches here as a finished
-/// `CVPixelBuffer` — this class exists so the view has something cheap to observe.
-@MainActor
-@Observable
-final class DecodedVideo {
-    private(set) var frame: CVPixelBuffer?
-    private(set) var framesDecoded = 0
-
-    fileprivate func publish(_ buffer: CVPixelBuffer) {
-        frame = buffer
-        framesDecoded += 1
-    }
-
-    func reset() {
-        frame = nil
-        framesDecoded = 0
-    }
-}
-
-/// Turns the console's H.264 into frames the headset can draw.
-///
-/// This is an `actor`, not `@MainActor`, on purpose: Annex-B parsing and building the
-/// `CMSampleBuffer` for each frame is real CPU work, measured at 10-16ms per frame on a
-/// busy scene — over a third of the 33ms budget a 30fps stream allows. Running that on
-/// the main actor put it in direct competition with SwiftUI and RealityKit's own
-/// per-frame work; the two only had to collide occasionally to fall behind, and once
-/// behind, packets queued up and the receive loop could never catch back up — measured
-/// as a frame rate that decayed over tens of seconds even though the console kept
-/// sending a rock-steady 30 packets/sec the whole time (confirmed by reading the wire
-/// protocol directly, bypassing this app entirely). Hardware decode itself is not the
-/// bottleneck — the M-series video block barely notices 720p30 — the setup work around
-/// it was, and it only had to run somewhere other than the render thread to stop
-/// costing frames.
+/// Decodes one access unit at a time off the main actor. The compressed queue is
+/// bounded by SysDVRStream and the decoded queue retains only the newest frame.
 actor H264Decoder {
     private let log = Logger(subsystem: "com.kagami.app", category: "decoder")
-    private let output: DecodedVideo
+    nonisolated let frames: AsyncStream<DecodedFrame>
+    private let continuation: AsyncStream<DecodedFrame>.Continuation
 
     private var session: VTDecompressionSession?
     private var format: CMVideoFormatDescription?
@@ -50,8 +19,15 @@ actor H264Decoder {
     /// produces green mush, so the stream is deliberately silent until then.
     private var waitingForKeyframe = true
 
-    init(output: DecodedVideo) {
-        self.output = output
+    init() {
+        let channel = AsyncStream<DecodedFrame>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        frames = channel.stream
+        continuation = channel.continuation
+    }
+
+    isolated deinit {
+        if let session { VTDecompressionSessionInvalidate(session) }
+        continuation.finish()
     }
 
     func reset() {
@@ -60,39 +36,70 @@ actor H264Decoder {
         format = nil
         parameterSets = []
         waitingForKeyframe = true
-        Task { @MainActor in output.reset() }
+    }
+
+    func finish() {
+        reset()
+        continuation.finish()
+    }
+
+    func recoverAfterDrop() {
+        // Keep SPS/PPS, but do not decode inter-predicted pictures until an IDR.
+        waitingForKeyframe = true
     }
 
     /// Feeds one access unit straight off the wire.
-    func decode(_ accessUnit: Data, timestampNanos: UInt64) {
+    func decode(_ accessUnit: Data, timestampMicros: UInt64) throws {
         // One pass over the buffer does all of it: pulls out SPS/PPS (glued to every
         // keyframe because SysDVR is asked to inject them), notices whether this is a
         // keyframe, and leaves the picture already length-prefixed for VideoToolbox.
         let parsed = AnnexB.parse(accessUnit)
-        if !parsed.parameterSets.isEmpty, parsed.parameterSets != parameterSets {
-            parameterSets = parsed.parameterSets
-            rebuildSession()
+        var parametersChanged = false
+        for incoming in parsed.parameterSets {
+            guard let header = incoming.first else { continue }
+            if let index = parameterSets.firstIndex(where: { ($0.first! & 0x1F) == (header & 0x1F) }
+            ) {
+                if parameterSets[index] != incoming {
+                    parameterSets[index] = incoming
+                    parametersChanged = true
+                }
+            } else {
+                parameterSets.append(incoming)
+                parametersChanged = true
+            }
+        }
+        if parametersChanged, parameterSets.count >= 2 {
+            try rebuildSession()
         }
 
         if parsed.isKeyframe { waitingForKeyframe = false }
         guard !waitingForKeyframe, let session, let format, !parsed.lengthPrefixedPicture.isEmpty else { return }
 
-        var block = parsed.lengthPrefixedPicture
+        let block = parsed.lengthPrefixedPicture
         var length = block.count
 
         var blockBuffer: CMBlockBuffer?
-        let blockStatus = block.withUnsafeMutableBytes { pointer -> OSStatus in
-            CMBlockBufferCreateWithMemoryBlock(
-                allocator: kCFAllocatorDefault, memoryBlock: pointer.baseAddress,
-                blockLength: length, blockAllocator: kCFAllocatorNull,
-                customBlockSource: nil, offsetToData: 0, dataLength: length,
-                flags: 0, blockBufferOut: &blockBuffer)
+        // CoreMedia owns the compressed bytes. A pointer borrowed from Data must
+        // never escape withUnsafeBytes, even when decode usually completes quickly.
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil,
+            blockLength: length, blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil, offsetToData: 0, dataLength: length,
+            flags: 0, blockBufferOut: &blockBuffer)
+        guard blockStatus == noErr, let blockBuffer else {
+            throw DecodeFailure(status: blockStatus)
         }
-        guard blockStatus == noErr, let blockBuffer else { return }
+        let copyStatus = block.withUnsafeBytes { pointer in
+            CMBlockBufferReplaceDataBytes(
+                with: pointer.baseAddress!, blockBuffer: blockBuffer,
+                offsetIntoDestination: 0, dataLength: length)
+        }
+        guard copyStatus == noErr else { throw DecodeFailure(status: copyStatus) }
 
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: CMTimeScale(SysDVR.Format.frameRate)),
-            presentationTimeStamp: CMTime(value: CMTimeValue(timestampNanos), timescale: 1_000_000_000),
+            presentationTimeStamp: CMTime(
+                value: CMTimeValue(clamping: timestampMicros), timescale: 1_000_000),
             decodeTimeStamp: .invalid)
 
         var sample: CMSampleBuffer?
@@ -101,23 +108,30 @@ actor H264Decoder {
             formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1,
             sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &length,
             sampleBufferOut: &sample)
-        guard sampleStatus == noErr, let sample else { return }
+        guard sampleStatus == noErr, let sample else { throw DecodeFailure(status: sampleStatus) }
 
-        let output = self.output
-        VTDecompressionSessionDecodeFrame(
+        let continuation = self.continuation
+        let callbackStatus = Mutex<OSStatus>(noErr)
+        let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
-            flags: [._EnableAsynchronousDecompression], infoFlagsOut: nil
+            flags: [], infoFlagsOut: nil
         ) { status, _, image, _, _ in
+            callbackStatus.withLock { $0 = status }
             guard status == noErr, let image else { return }
             // VideoToolbox calls back off the actor and CVImageBuffer is not Sendable.
             // The box carries it across: the buffer leaves the decoder finished and is
             // only ever read from here on — the drawing side never writes to it.
             let ready = DecodedFrame(buffer: image)
-            Task { @MainActor in output.publish(ready.buffer) }
+            continuation.yield(ready)
+        }
+        let outputStatus = callbackStatus.withLock { $0 }
+        guard status == noErr, outputStatus == noErr else {
+            waitingForKeyframe = true
+            throw DecodeFailure(status: status == noErr ? outputStatus : status)
         }
     }
 
-    private func rebuildSession() {
+    private func rebuildSession() throws {
         if let session { VTDecompressionSessionInvalidate(session) }
         session = nil
         format = nil
@@ -149,28 +163,41 @@ actor H264Decoder {
         }
         guard status == noErr, let description else {
             log.error("could not build the H.264 format description: \(status)")
-            return
+            throw DecodeFailure(status: status)
         }
         format = description
 
-        // BGRA because that is what the RealityKit texture takes directly, with no
-        // colour conversion step in between.
+        // Keep the decoder's native YUV planes; the video layer handles presentation.
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
         var created: VTDecompressionSession?
-        VTDecompressionSessionCreate(
+        let creationStatus = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault, formatDescription: description,
             decoderSpecification: nil, imageBufferAttributes: attributes as CFDictionary,
             outputCallback: nil, decompressionSessionOut: &created)
+        guard creationStatus == noErr, created != nil else {
+            throw DecodeFailure(status: creationStatus)
+        }
         session = created
+        if let created {
+            VTSessionSetProperty(
+                created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        }
         waitingForKeyframe = true
     }
 }
 
 /// Carries a `CVPixelBuffer` off the actor. `@unchecked` is the discipline described at
 /// the use site: read-only from here on.
-private struct DecodedFrame: @unchecked Sendable {
+struct DecodedFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer
+    let decodedAt = ContinuousClock.now
+}
+
+struct DecodeFailure: LocalizedError {
+    let status: OSStatus
+    var errorDescription: String? { "Video decoder failed (\(status))." }
 }

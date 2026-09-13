@@ -101,7 +101,7 @@ struct ConnectView: View {
                 .foregroundStyle(.tertiary)
 
             step(1, String(localized: "Atmosphère, with SysDVR installed as a sysmodule."))
-            step(2, String(localized: "SysDVR set to Simple network mode (TCP), then reboot."))
+            step(2, String(localized: "SysDVR set to TCP Bridge mode, then reboot."))
             step(3, String(localized: "Both devices on the same network. Wired beats Wi-Fi."))
         }
     }
