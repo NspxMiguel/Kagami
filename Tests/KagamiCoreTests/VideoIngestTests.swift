@@ -95,10 +95,14 @@ final class VideoIngestTests: XCTestCase, @unchecked Sendable {
         // Feed a little past frame 150 (the fixture's second IDR) so the resumption
         // itself, not just the wait, is observable.
         for index in 0..<155 {
-            // Corruption is not itself an ingest-level throw the caller must react to —
-            // it surfaces as a decode error from one bad access unit, which is expected
-            // here, so tolerate it and keep feeding the rest of the GOP.
-            try? await ingest.accept(
+            // `accept` does not throw for a decode error — `H264Decoder` has already
+            // recovered in place (it enters its own keyframe wait before it throws), so
+            // there is nothing left for the caller to react to. A plain `try` here is
+            // itself the regression test: if `accept` ever started rethrowing decode
+            // errors again, `Session.runVideo`'s packet loop would tear the live
+            // connection down over a single bad access unit, and this call would need
+            // `try?` to keep the loop feeding the rest of the GOP.
+            try await ingest.accept(
                 Self.packet(units[index], sequence: index, origin: origin, receivedAt: nil))
         }
 

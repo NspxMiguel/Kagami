@@ -1,5 +1,6 @@
 import CoreMedia
 import CoreVideo
+import Dispatch
 import Foundation
 import OSLog
 import Synchronization
@@ -90,7 +91,14 @@ actor H264Decoder {
                 parametersChanged = true
             }
         }
-        if parametersChanged, parameterSets.count >= 2 {
+        // Retried on every keyframe while there is no live session, not only when the
+        // parameter sets themselves changed: a session that failed to build (a rare
+        // VideoToolbox/CoreMedia allocation failure) leaves `parameterSets` already
+        // holding byte-identical content to what the next IDR will carry, so
+        // `parametersChanged` alone would never fire again and the decoder would be
+        // stuck silently forever. `parsed.isKeyframe` keeps the retry off the far more
+        // frequent P-frames, where there is nothing new to rebuild from anyway.
+        if parameterSets.count >= 2, parametersChanged || (session == nil && parsed.isKeyframe) {
             try rebuildSession()
         }
 
@@ -100,39 +108,49 @@ actor H264Decoder {
         let block = parsed.lengthPrefixedPicture
         var length = block.count
 
-        var blockBuffer: CMBlockBuffer?
-        // CoreMedia owns the compressed bytes. A pointer borrowed from Data must
-        // never escape withUnsafeBytes, even when decode usually completes quickly.
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil,
-            blockLength: length, blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil, offsetToData: 0, dataLength: length,
-            flags: 0, blockBufferOut: &blockBuffer)
-        guard blockStatus == noErr, let blockBuffer else {
-            throw DecodeFailure(status: blockStatus)
+        // Any failure from here on means this access unit never reached VideoToolbox at
+        // all — if it was a P-frame, the reference chain it would have updated is now
+        // missing, exactly like a rejected decode. `enterKeyframeWait()` is idempotent
+        // (guarded by `waitingForKeyframe`), so this only ever costs one counter
+        // increment even though `submit` below also calls it on its own failure path.
+        do {
+            var blockBuffer: CMBlockBuffer?
+            // CoreMedia owns the compressed bytes. A pointer borrowed from Data must
+            // never escape withUnsafeBytes, even when decode usually completes quickly.
+            let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault, memoryBlock: nil,
+                blockLength: length, blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil, offsetToData: 0, dataLength: length,
+                flags: 0, blockBufferOut: &blockBuffer)
+            guard blockStatus == noErr, let blockBuffer else {
+                throw DecodeFailure(status: blockStatus)
+            }
+            let copyStatus = block.withUnsafeBytes { pointer in
+                CMBlockBufferReplaceDataBytes(
+                    with: pointer.baseAddress!, blockBuffer: blockBuffer,
+                    offsetIntoDestination: 0, dataLength: length)
+            }
+            guard copyStatus == noErr else { throw DecodeFailure(status: copyStatus) }
+
+            var timing = CMSampleTimingInfo(
+                duration: CMTime(value: 1, timescale: CMTimeScale(SysDVR.Format.frameRate)),
+                presentationTimeStamp: CMTime(
+                    value: CMTimeValue(clamping: timestampMicros), timescale: 1_000_000),
+                decodeTimeStamp: .invalid)
+
+            var sample: CMSampleBuffer?
+            let sampleStatus = CMSampleBufferCreateReady(
+                allocator: kCFAllocatorDefault, dataBuffer: blockBuffer,
+                formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &length,
+                sampleBufferOut: &sample)
+            guard sampleStatus == noErr, let sample else { throw DecodeFailure(status: sampleStatus) }
+
+            try submit(sample, session: session, timestampMicros: timestampMicros, suppressOutput: suppressOutput)
+        } catch {
+            enterKeyframeWait()
+            throw error
         }
-        let copyStatus = block.withUnsafeBytes { pointer in
-            CMBlockBufferReplaceDataBytes(
-                with: pointer.baseAddress!, blockBuffer: blockBuffer,
-                offsetIntoDestination: 0, dataLength: length)
-        }
-        guard copyStatus == noErr else { throw DecodeFailure(status: copyStatus) }
-
-        var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: CMTimeScale(SysDVR.Format.frameRate)),
-            presentationTimeStamp: CMTime(
-                value: CMTimeValue(clamping: timestampMicros), timescale: 1_000_000),
-            decodeTimeStamp: .invalid)
-
-        var sample: CMSampleBuffer?
-        let sampleStatus = CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: blockBuffer,
-            formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &length,
-            sampleBufferOut: &sample)
-        guard sampleStatus == noErr, let sample else { throw DecodeFailure(status: sampleStatus) }
-
-        try submit(sample, session: session, timestampMicros: timestampMicros, suppressOutput: suppressOutput)
     }
 
     /// Submits one sample to VideoToolbox, with the do-not-output hint when the pipeline
@@ -163,21 +181,40 @@ actor H264Decoder {
         let continuation = self.continuation
         let stats = self.stats
         let callbackStatus = Mutex<OSStatus>(noErr)
+        // Without `.enableAsynchronousDecompression` the callback is documented to fire
+        // before `VTDecompressionSessionDecodeFrame` returns, but that is a hint about
+        // typical decoder behaviour, not a contract every hardware decoder honours.
+        // Waiting on this instead of reading the Mutex immediately after the call
+        // returns means a genuinely asynchronous callback is still observed correctly
+        // rather than silently read as its stale `noErr` default. The wait costs
+        // nothing in the documented (synchronous) case, because `done` is already
+        // signalled by the time this line runs.
+        let done = DispatchSemaphore(value: 0)
         let flags: VTDecodeFrameFlags = doNotOutput ? [._DoNotOutputFrame] : []
         let status = VTDecompressionSessionDecodeFrame(
             session, sampleBuffer: sample,
             flags: flags, infoFlagsOut: nil
         ) { status, _, image, _, _ in
             callbackStatus.withLock { $0 = status }
-            guard status == noErr, let image else { return }
-            // VideoToolbox calls back off the actor and CVImageBuffer is not Sendable.
-            // The box carries it across: the buffer leaves the decoder finished and is
-            // only ever read from here on — the drawing side never writes to it.
-            stats?.increment(\.framesDecoded)
-            continuation.yield(DecodedFrame(buffer: image, timestampMicros: timestampMicros))
+            if status == noErr, let image {
+                // VideoToolbox calls back off the actor and CVImageBuffer is not
+                // Sendable. The box carries it across: the buffer leaves the decoder
+                // finished and is only ever read from here on — the drawing side never
+                // writes to it.
+                stats?.increment(\.framesDecoded)
+                continuation.yield(DecodedFrame(buffer: image, timestampMicros: timestampMicros))
+            }
+            done.signal()
         }
-        let outputStatus = callbackStatus.withLock { $0 }
-        return status == noErr ? outputStatus : status
+        guard status == noErr else { return status }
+        // Bounded well above the ~2 ms measured decode cost and the 33 ms frame budget,
+        // so a genuinely wedged decoder cannot hang this actor forever — it is treated
+        // as a decode error (a real one, since nothing decoded) instead.
+        if done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
+            log.error("VideoToolbox decode callback did not fire within 200ms")
+            return kVTVideoDecoderMalfunctionErr
+        }
+        return callbackStatus.withLock { $0 }
     }
 
     private func enterKeyframeWait() {
@@ -200,6 +237,12 @@ actor H264Decoder {
         if let session { VTDecompressionSessionInvalidate(session) }
         session = nil
         format = nil
+        // Whatever reference frames the old session held are gone the moment it is
+        // invalidated — called unconditionally, before either failure path below, so a
+        // rebuild that fails to even produce a session still leaves the decoder in the
+        // same recovered state a successful rebuild would, instead of leaving
+        // `waitingForKeyframe` stale while `session` is nil.
+        enterKeyframeWait()
 
         // The parameter sets must stay alive and contiguous for the duration of the
         // call, and CoreMedia wants non-optional pointers — hence the manual allocation
@@ -251,8 +294,6 @@ actor H264Decoder {
             VTSessionSetProperty(
                 created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         }
-        // A new SPS means whatever reference frames the old session held are gone.
-        enterKeyframeWait()
     }
 }
 

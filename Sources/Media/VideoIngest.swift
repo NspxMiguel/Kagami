@@ -48,8 +48,18 @@ actor VideoIngest {
                 packet.payload, timestampMicros: packet.header.timestamp,
                 suppressOutput: backlog > Self.oneFrameBudget)
         } catch {
+            // A decode error is not a dead connection. `H264Decoder` has already
+            // recovered in place — it enters its own keyframe wait before it ever
+            // throws (see `H264Decoder.submit`/`rebuildSession`) — so the reference
+            // chain is already back to a known-good state and decoding resumes on its
+            // own at the next IDR. Rethrowing here would reach `Session.runVideo`'s
+            // packet loop, which has no way to tell this apart from a dead socket and
+            // would tear the live TCP connection down: that discards whatever access
+            // units the console already queued in the OS socket buffer, which is
+            // exactly the client-side packet drop this pipeline exists to avoid, and
+            // pays a full handshake plus keyframe wait for a single bad access unit
+            // the decoder was already recovering from without any help from us.
             stats.increment(\.decodeErrors)
-            throw error
         }
     }
 
