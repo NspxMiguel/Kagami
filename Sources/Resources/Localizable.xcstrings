@@ -528,6 +528,22 @@
           }
         }
       }
+    },
+    "Reconnecting": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reconnecting"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reconectando"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

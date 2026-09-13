@@ -67,7 +67,12 @@ final class Session {
         stats.reset()
         framesPerSecond = 0
         state = .connecting
-        videoTask = Task { await runVideo(host: target, blankScreen: blankScreen, token: token) }
+        // Captured once, synchronously, while still on the main actor: `runVideo` is
+        // nonisolated and runs its decode loop off the main actor entirely, so it must
+        // not touch `decoder` (a `@MainActor` type) itself on every frame just to reach
+        // this one `Sendable` slot.
+        let slot = decoder.slot
+        videoTask = Task { await runVideo(host: target, blankScreen: blankScreen, token: token, slot: slot) }
         if playAudio, let output = AudioOutput() {
             audio = output
             output.start()
@@ -98,7 +103,9 @@ final class Session {
     /// a truly gone console does not make the UI wait much longer than that per attempt.
     private nonisolated static let reconnectBackoffMillis = [300, 1000, 2000]
 
-    nonisolated private func runVideo(host: String, blankScreen: Bool, token: UUID) async {
+    nonisolated private func runVideo(
+        host: String, blankScreen: Bool, token: UUID, slot: LatestFrameSlot
+    ) async {
         var retry = 0
         while !Task.isCancelled {
             let stream = SysDVRStream(host: host, kind: .video, turnOffConsoleScreen: blankScreen)
@@ -109,15 +116,15 @@ final class Session {
                 try await stream.connect()
                 try Task.checkCancellation()
                 await setState(.waitingForGame, token: token)
-                presentation = Task { @MainActor in
+                // Off the main actor end to end: this just forwards whatever the
+                // decoder produced into the slot the renderer pulls from. Nothing here
+                // decides presentation state — the watchdog derives `.streaming` from
+                // frames actually reaching the screen, once a second, rather than this
+                // loop hopping to the main actor on every one of them.
+                presentation = Task {
                     for await frame in ingest.frames {
-                        guard !Task.isCancelled, self.generation == token else { break }
-                        guard frame.decodedAt.duration(to: .now) < .milliseconds(100) else {
-                            continue
-                        }
-                        self.decoder.publish(frame.buffer)
-                        self.lastFrameAt = .now
-                        self.state = .streaming
+                        guard !Task.isCancelled else { break }
+                        slot.write(LatestFrameSlot.Frame(buffer: frame.buffer, timestampMicros: frame.timestampMicros))
                     }
                 }
                 for try await packet in await stream.packets() {
@@ -155,6 +162,10 @@ final class Session {
                 await fail(terminalError, token: token)
                 return
             }
+            // Deliberately does not touch `slot` or the decoder's last output: the
+            // point of reconnecting instead of failing is that the picture already on
+            // screen stays there, dimmed, until the next connection produces a fresh
+            // one.
             await setState(.reconnecting, token: token)
             stats.increment(\.reconnects)
             retry = min(retry + 1, Self.reconnectBackoffMillis.count)
@@ -215,9 +226,10 @@ final class Session {
                 let seconds =
                     Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds)
                     / 1e18
+                var displayedThisTick = 0
                 if let count, let previousCount {
-                    framesPerSecond = Int(
-                        (Double(max(0, count - previousCount)) / seconds).rounded())
+                    displayedThisTick = max(0, count - previousCount)
+                    framesPerSecond = Int((Double(displayedThisTick) / seconds).rounded())
                 } else {
                     framesPerSecond = 0
                 }
@@ -225,7 +237,18 @@ final class Session {
                 previousTime = now
                 if let count { stats.set(\.framesDisplayed, to: count) }
                 logDiagnosticsIfEnabled(framesDisplayedPerSecond: framesPerSecond)
-                if state == .streaming, lastFrameAt.duration(to: now) > .seconds(2) {
+                // `.streaming` is derived here, once a second, rather than the moment a
+                // frame is decoded: that per-frame update used to mean a main-actor hop
+                // on every single one. A frame actually reaching the display layer
+                // (proven by the renderer's own metrics, not by the decoder producing
+                // one) is what "streaming" means.
+                if displayedThisTick > 0 {
+                    lastFrameAt = now
+                    switch state {
+                    case .connecting, .waitingForGame, .reconnecting: state = .streaming
+                    default: break
+                    }
+                } else if state == .streaming, lastFrameAt.duration(to: now) > .seconds(2) {
                     state = .waitingForGame
                     ambientComponents = (0, 0, 0)
                 }

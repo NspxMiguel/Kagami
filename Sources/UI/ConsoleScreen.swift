@@ -45,6 +45,11 @@ struct ConsoleScreen: View {
 
     /// What the screen says when there is no picture. Each case names the next step
     /// rather than the failure — "no frames" is true and useless.
+    ///
+    /// `.reconnecting` is deliberately not a `status(...)` card: the console dropping
+    /// for a moment does not mean the picture the person was looking at is gone, so the
+    /// last frame stays up, dimmed, under a small badge — not replaced by a full black
+    /// panel the way a real disconnect is.
     @ViewBuilder
     private var overlay: some View {
         switch session.state {
@@ -55,12 +60,7 @@ struct ConsoleScreen: View {
                    spinning: true)
 
         case .reconnecting:
-            status(
-                icon: "antenna.radiowaves.left.and.right",
-                title: String(localized: "Reconnecting to the console"),
-                detail: String(
-                    localized: "Keep the console awake. The picture will return automatically."),
-                spinning: true)
+            reconnectingBadge
 
         case .waitingForGame:
             status(icon: "gamecontroller",
@@ -77,6 +77,33 @@ struct ConsoleScreen: View {
         case .idle, .streaming:
             EmptyView()
         }
+    }
+
+    /// A small badge over a dimmed — not blacked-out — picture. Keeping the last frame
+    /// visible is the point: the console is very likely still there, and a viewer
+    /// mid-game should not lose the picture over a socket blip that resolves in under a
+    /// second.
+    private var reconnectingBadge: some View {
+        ZStack {
+            Rectangle().fill(.black.opacity(0.35))
+            VStack {
+                Spacer()
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "Reconnecting"))
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.bottom, 28)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(String(localized: "Reconnecting to the console"))
+        .accessibilityValue(
+            String(localized: "Keep the console awake. The picture will return automatically."))
     }
 
     private func status(icon: String, title: String, detail: String, spinning: Bool) -> some View {
