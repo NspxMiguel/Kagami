@@ -258,6 +258,48 @@ final class StreamingTests: XCTestCase, @unchecked Sendable {
         await stream.close()
     }
 
+    /// A single header-plus-payload read that takes longer than the idle timeout to
+    /// assemble — because the peer is dribbling bytes in slowly, never actually going
+    /// silent — must still arrive rather than being treated as a dead socket. This is
+    /// the regression test for measuring "no bytes at all", not "how long did this one
+    /// read take": every gap between chunks here is well under the 3 s idle window, but
+    /// their sum is not.
+    func testTrickleSlowerThanTheIdleTimeoutStillArrives() async throws {
+        var wholePacket = Data()
+        wholePacket.appendTestPacket(7)
+        let chunkSize = 5
+        let chunks: [Data] = {
+            var pieces: [Data] = []
+            var offset = wholePacket.startIndex
+            while offset < wholePacket.endIndex {
+                let end =
+                    wholePacket.index(offset, offsetBy: chunkSize, limitedBy: wholePacket.endIndex)
+                    ?? wholePacket.endIndex
+                pieces.append(Data(wholePacket[offset..<end]))
+                offset = end
+            }
+            return pieces
+        }()
+
+        let peer = try TestPeer(bytes: TestPeer.handshake) { connection in
+            Task {
+                for chunk in chunks {
+                    try? await Task.sleep(for: .milliseconds(900))
+                    connection.send(content: chunk, completion: .contentProcessed { _ in })
+                }
+            }
+        }
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        try await stream.connect()
+        var iterator = await stream.packets().makeAsyncIterator()
+        let received = try await iterator.next()
+        XCTAssertEqual(received?.sequence, 0)
+        XCTAssertEqual(received?.payload, Data([7]))
+        await stream.close()
+    }
+
     /// A socket that goes silent past the idle timeout is the one lateness-shaped thing
     /// that should still end the connection — nothing else can tell the console is
     /// actually gone rather than just slow.

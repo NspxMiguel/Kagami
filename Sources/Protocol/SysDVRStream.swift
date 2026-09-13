@@ -217,18 +217,39 @@ actor SysDVRStream {
         }
     }
 
-    /// No bytes at all for this long means the socket is dead, not merely slow — a slow
+    /// No bytes AT ALL for this long means the socket is dead, not merely slow — a slow
     /// but live connection is `VideoIngest`'s problem to catch up from, not a reason to
     /// tear down a TCP connection that would only need to be renegotiated and wait for
     /// another keyframe. This is the one place that distinction is actually enforced.
+    ///
+    /// The timer resets on every partial delivery (see `receiveExactly`), not once per
+    /// whole read: a single `minimumIncompleteLength: count` receive only completes once
+    /// every one of `count` bytes is in hand, so racing a flat timeout against that one
+    /// call would measure "how long did this whole read take", not "how long has the
+    /// socket gone silent" — a connection that is genuinely still delivering bytes, just
+    /// too slowly to finish one large I-frame payload inside the window, would time out
+    /// exactly like a dead one. Reading in small increments and resetting the clock on
+    /// each one is what makes this actually mean idle.
     private static let readIdleTimeout = Duration.seconds(3)
 
     private func receiveExactly(_ count: Int) async throws -> Data {
         guard count > 0 else { return Data() }
-        return try await withTaskCancellationHandler {
+        var buffer = Data()
+        buffer.reserveCapacity(count)
+        while buffer.count < count {
+            buffer.append(try await receiveSomeWithIdleTimeout(upTo: count - buffer.count))
+        }
+        return buffer
+    }
+
+    /// Waits for at least one byte (and at most `maximumLength`), racing that against
+    /// the idle timeout. Called in a loop by `receiveExactly` so the timeout restarts
+    /// after every delivery instead of covering one whole multi-byte read.
+    private func receiveSomeWithIdleTimeout(upTo maximumLength: Int) async throws -> Data {
+        try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withThrowingTaskGroup(of: Data.self) { group in
-                group.addTask { try await self.rawReceive(count) }
+                group.addTask { try await self.rawReceive(maximumLength: maximumLength) }
                 group.addTask {
                     try await Task.sleep(for: Self.readIdleTimeout)
                     throw Failure.timedOut
@@ -252,13 +273,16 @@ actor SysDVRStream {
         }
     }
 
-    private func rawReceive(_ count: Int) async throws -> Data {
+    /// Returns as soon as at least one byte is available, never waiting for all of
+    /// `maximumLength` — that partial-progress behaviour is exactly what lets the idle
+    /// timer above measure genuine silence instead of one whole read's duration.
+    private func rawReceive(maximumLength: Int) async throws -> Data {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { cont in
-                connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: maximumLength) { data, _, _, error in
                     if let error { cont.resume(throwing: error); return }
-                    guard let data, data.count == count else {
+                    guard let data, !data.isEmpty else {
                         cont.resume(throwing: Failure.closed); return
                     }
                     cont.resume(returning: data)
