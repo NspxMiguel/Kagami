@@ -11,6 +11,13 @@ targets:
     platform: visionOS
     sources:
       - path: Sources
+        excludes:
+          # Tools/stamp-build.sh writes this straight into the built product
+          # (CODESIGNING_FOLDER_PATH) instead of relying on a Copy Bundle Resources
+          # file reference — see that script's comment for why. Excluding it here
+          # keeps the generated project the same whether or not the gitignored
+          # source-tree copy happens to exist when `xcodegen generate` runs.
+          - "Resources/BuildInfo.json"
     preBuildScripts:
       - name: Stamp build info
         script: |
