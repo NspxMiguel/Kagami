@@ -203,6 +203,74 @@ final class StreamingTests: XCTestCase, @unchecked Sendable {
         for await _ in decoder.frames { count += 1 }
         XCTAssertTrue(count == 1)
     }
+
+    /// A stall well under the read-idle timeout must never tear down the connection —
+    /// that used to cost a handshake plus a wait for the next keyframe for a delay the
+    /// network was always going to recover from on its own.
+    func testStallUnderTheIdleTimeoutNeverClosesTheConnection() async throws {
+        var initial = TestPeer.handshake
+        for index in 0..<90 { initial.appendTestPacket(index) }
+        let burst: Data = {
+            var data = Data()
+            for index in 90..<165 { data.appendTestPacket(index) }
+            return data
+        }()
+
+        let peer = try TestPeer(bytes: initial) { connection in
+            Task {
+                try? await Task.sleep(for: .milliseconds(2_500))
+                connection.send(content: burst, completion: .contentProcessed { _ in })
+            }
+        }
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        try await stream.connect()
+        var received: [SysDVRStream.Packet] = []
+        var iterator = await stream.packets().makeAsyncIterator()
+        for _ in 0..<165 {
+            guard let packet = try await iterator.next() else { break }
+            received.append(packet)
+        }
+        XCTAssertEqual(received.count, 165)
+        XCTAssertEqual(received.map(\.sequence), Array(0..<165))
+        await stream.close()
+    }
+
+    /// A socket that goes silent past the idle timeout is the one lateness-shaped thing
+    /// that should still end the connection — nothing else can tell the console is
+    /// actually gone rather than just slow.
+    func testIdleSocketTimesOutRatherThanHangingForever() async throws {
+        let peer = try TestPeer(bytes: TestPeer.handshake)
+        let port = try await peer.start()
+        defer { peer.stop() }
+        let stream = SysDVRStream(host: "127.0.0.1", kind: .video, port: port)
+        try await stream.connect()
+        let start = ContinuousClock.now
+        do {
+            for try await _ in await stream.packets() { XCTFail("Idle peer produced a packet") }
+            XCTFail("Idle peer's stream ended without error")
+        } catch SysDVRStream.Failure.timedOut {
+        } catch {
+            XCTFail("Expected .timedOut, got \(error)")
+        }
+        let elapsed = start.duration(to: .now)
+        XCTAssertGreaterThanOrEqual(elapsed, .seconds(3))
+        XCTAssertLessThan(elapsed, .seconds(5))
+        await stream.close()
+    }
+}
+
+extension Data {
+    /// One synthetic video packet: 18-byte header plus a 1-byte payload carrying its
+    /// own index, so a test can check both ordering and content without decoding
+    /// anything.
+    fileprivate mutating func appendTestPacket(_ index: Int) {
+        append(littleEndian: SysDVR.PacketHeader.magic)
+        append(littleEndian: UInt32(1))
+        append(littleEndian: UInt64(index * 33_333))
+        append(contentsOf: [1, 0, UInt8(truncatingIfNeeded: index)])
+    }
 }
 
 private final class TestPeer: @unchecked Sendable {
@@ -215,11 +283,13 @@ private final class TestPeer: @unchecked Sendable {
 
     private let listener: NWListener
     private let bytes: Data
+    private let onConnect: (@Sendable (NWConnection) -> Void)?
     private let lock = NSLock()
     private var connections: [NWConnection] = []
 
-    init(bytes: Data) throws {
+    init(bytes: Data, onConnect: (@Sendable (NWConnection) -> Void)? = nil) throws {
         self.bytes = bytes
+        self.onConnect = onConnect
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
@@ -232,6 +302,7 @@ private final class TestPeer: @unchecked Sendable {
             if !bytes.isEmpty {
                 connection.send(content: bytes, completion: .contentProcessed { _ in })
             }
+            onConnect?(connection)
         }
         return try await withCheckedThrowingContinuation { continuation in
             listener.stateUpdateHandler = { [self] state in

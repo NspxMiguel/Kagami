@@ -93,11 +93,16 @@ final class Session {
         state = .idle
     }
 
+    /// Backoff between reconnect attempts, indexed by `retry - 1`. Short first, because
+    /// most drops are the console still being reachable a moment later; capped at 2 s so
+    /// a truly gone console does not make the UI wait much longer than that per attempt.
+    private nonisolated static let reconnectBackoffMillis = [300, 1000, 2000]
+
     nonisolated private func runVideo(host: String, blankScreen: Bool, token: UUID) async {
         var retry = 0
         while !Task.isCancelled {
             let stream = SysDVRStream(host: host, kind: .video, turnOffConsoleScreen: blankScreen)
-            let worker = H264Decoder()
+            let ingest = VideoIngest(stats: stats)
             var presentation: Task<Void, Never>?
             var terminalError: String?
             do {
@@ -105,9 +110,8 @@ final class Session {
                 try Task.checkCancellation()
                 await setState(.waitingForGame, token: token)
                 presentation = Task { @MainActor in
-                    for await frame in worker.frames {
+                    for await frame in ingest.frames {
                         guard !Task.isCancelled, self.generation == token else { break }
-                        self.stats.increment(\.framesDecoded)
                         guard frame.decodedAt.duration(to: .now) < .milliseconds(100) else {
                             continue
                         }
@@ -116,14 +120,6 @@ final class Session {
                         self.state = .streaming
                     }
                 }
-                var previousSequence = -1
-                var timeline = StreamTimeline()
-                var stalePackets = 0
-                // Edge-triggered so a whole run of stale packets in one stall counts as
-                // one wait, not one per packet — mirrors the decoder's own
-                // waitingForKeyframe flag without an extra actor round trip to read it.
-                var awaitingKeyframe = false
-                var keyframeWaitStartedAt: ContinuousClock.Instant?
                 for try await packet in await stream.packets() {
                     try Task.checkCancellation()
                     if packet.header.flags.contains(.error) {
@@ -134,47 +130,7 @@ final class Session {
                     guard !packet.payload.isEmpty else { continue }
                     stats.increment(\.packetsReceived)
                     stats.increment(\.bytesReceived, by: packet.payload.count)
-                    if packet.sequence != previousSequence + 1 {
-                        stats.increment(
-                            \.compressedDropped, by: max(0, packet.sequence - previousSequence - 1))
-                        if !awaitingKeyframe {
-                            awaitingKeyframe = true
-                            keyframeWaitStartedAt = .now
-                            stats.increment(\.keyframeWaitsEntered)
-                        }
-                        await worker.recoverAfterDrop()
-                    }
-                    previousSequence = packet.sequence
-                    let transportDelay = timeline.excessDelay(
-                        timestampMicros: packet.header.timestamp,
-                        receivedAt: packet.receivedAt)
-                    stats.set(\.receiveBacklogMillis, to: milliseconds(transportDelay))
-                    guard transportDelay + packet.receivedAt.duration(to: .now) < .milliseconds(120)
-                    else {
-                        if !awaitingKeyframe {
-                            awaitingKeyframe = true
-                            keyframeWaitStartedAt = .now
-                            stats.increment(\.keyframeWaitsEntered)
-                        }
-                        await worker.recoverAfterDrop()
-                        stalePackets += 1
-                        if stalePackets >= 30 { throw SysDVRStream.Failure.excessiveLatency }
-                        continue
-                    }
-                    stalePackets = 0
-                    if awaitingKeyframe, let startedAt = keyframeWaitStartedAt {
-                        stats.increment(\.keyframeWaitMillisTotal, by: milliseconds(startedAt.duration(to: .now)))
-                    }
-                    awaitingKeyframe = false
-                    keyframeWaitStartedAt = nil
-                    stats.increment(\.decodeCalls)
-                    do {
-                        try await worker.decode(
-                            packet.payload, timestampMicros: packet.header.timestamp)
-                    } catch {
-                        stats.increment(\.decodeErrors)
-                        throw error
-                    }
+                    try await ingest.accept(packet)
                     retry = 0
                 }
             } catch {
@@ -192,7 +148,7 @@ final class Session {
             }
             presentation?.cancel()
             await stream.close()
-            await worker.finish()
+            await ingest.finish()
             if let presentation { await presentation.value }
             guard !Task.isCancelled else { return }
             if let terminalError {
@@ -201,8 +157,10 @@ final class Session {
             }
             await setState(.reconnecting, token: token)
             stats.increment(\.reconnects)
-            retry = min(retry + 1, 4)
-            do { try await Task.sleep(for: .milliseconds(retry == 1 ? 300 : retry * 1000)) } catch {
+            retry = min(retry + 1, Self.reconnectBackoffMillis.count)
+            do {
+                try await Task.sleep(for: .milliseconds(Self.reconnectBackoffMillis[retry - 1]))
+            } catch {
                 return
             }
         }
@@ -213,23 +171,16 @@ final class Session {
             let stream = SysDVRStream(host: host, kind: .audio)
             do {
                 try await stream.connect()
-                var timeline = StreamTimeline()
-                var stalePackets = 0
+                // No lateness gate here any more: a slow audio packet is caught up by
+                // the output's own ring buffer trimming to stay live (kagami-6), not by
+                // this loop deciding the connection itself is bad. The only way this
+                // reconnects now is a dead socket, via `SysDVRStream`'s own read-idle
+                // timeout.
                 for try await packet in await stream.packets() {
                     try Task.checkCancellation()
                     guard !packet.payload.isEmpty, !packet.header.flags.contains(.error) else { continue }
                     stats.increment(\.packetsReceived)
                     stats.increment(\.bytesReceived, by: packet.payload.count)
-                    let transportDelay = timeline.excessDelay(
-                        timestampMicros: packet.header.timestamp,
-                        receivedAt: packet.receivedAt)
-                    guard transportDelay + packet.receivedAt.duration(to: .now) < .milliseconds(80)
-                    else {
-                        stalePackets += 1
-                        if stalePackets >= 40 { throw SysDVRStream.Failure.excessiveLatency }
-                        continue
-                    }
-                    stalePackets = 0
                     output.play(packet.payload)
                 }
             } catch {

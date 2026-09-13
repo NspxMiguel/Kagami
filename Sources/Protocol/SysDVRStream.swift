@@ -34,13 +34,11 @@ actor SysDVRStream {
         case desynchronised
         case closed
         case timedOut
-        case excessiveLatency
         /// The pipeline fell further behind live than any amount of catch-up could fix
-        /// — see `VideoIngest.hardBacklogCeiling`. Fix 4 replaces the lateness-based
-        /// reconnect this enum used to have with a genuine dead-socket timeout; this one
-        /// case survives that change; it is not "data is late" but "so late that no
-        /// realistic amount of catch-up decoding fixes it," which stays a reconnect
-        /// reason even once the socket itself is proven alive.
+        /// — see `VideoIngest.hardBacklogCeiling`. This is the one place a reconnect is
+        /// triggered by lateness rather than by the socket itself being dead, and only
+        /// because 3 s of backlog means something is wrong with the connection, not the
+        /// decoder.
         case backlogExceeded
 
         var errorDescription: String? {
@@ -56,8 +54,6 @@ actor SysDVRStream {
                 return String(localized: "The stream lost sync with the console.")
             case .closed:
                 return String(localized: "The console closed the connection.")
-            case .excessiveLatency:
-                return "Stream latency exceeded the recovery budget."
             case .backlogExceeded:
                 return String(localized: "The stream fell too far behind live to catch up.")
             case .timedOut:
@@ -221,20 +217,59 @@ actor SysDVRStream {
         }
     }
 
+    /// No bytes at all for this long means the socket is dead, not merely slow — a slow
+    /// but live connection is `VideoIngest`'s problem to catch up from, not a reason to
+    /// tear down a TCP connection that would only need to be renegotiated and wait for
+    /// another keyframe. This is the one place that distinction is actually enforced.
+    private static let readIdleTimeout = Duration.seconds(3)
+
     private func receiveExactly(_ count: Int) async throws -> Data {
         guard count > 0 else { return Data() }
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            return try await withCheckedThrowingContinuation { cont in
-            connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
-                if let error { cont.resume(throwing: error); return }
-                guard let data, data.count == count else {
-                    cont.resume(throwing: Failure.closed); return
+            return try await withThrowingTaskGroup(of: Data.self) { group in
+                group.addTask { try await self.rawReceive(count) }
+                group.addTask {
+                    try await Task.sleep(for: Self.readIdleTimeout)
+                    throw Failure.timedOut
                 }
-                cont.resume(returning: data)
-            }
+                // `group.next()` returns as soon as either task finishes, but exiting
+                // this scope still has to wait for BOTH to actually complete — a
+                // `cancelAll()` only sets the flag `Task.isCancelled` reads, it does not
+                // itself unblock a continuation. So when the timeout wins the race, the
+                // losing `rawReceive` would otherwise hang here forever: nothing was
+                // ever going to resume its continuation, because the peer really did
+                // stop sending. `rawReceive` cancels the connection from its own
+                // `onCancel` handler for exactly this reason — that is what turns this
+                // `cancelAll()` into a real, timely unblock instead of a wait that never
+                // ends.
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
             }
         } onCancel: {
+            self.connection.cancel()
+        }
+    }
+
+    private func rawReceive(_ count: Int) async throws -> Data {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { cont in
+                connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+                    if let error { cont.resume(throwing: error); return }
+                    guard let data, data.count == count else {
+                        cont.resume(throwing: Failure.closed); return
+                    }
+                    cont.resume(returning: data)
+                }
+            }
+        } onCancel: {
+            // Fires when this loses the race against the idle timeout (via the
+            // enclosing group's `cancelAll()`) as much as when the outer caller cancels
+            // outright. Either way there is nothing to wait for any more, and cancelling
+            // the connection is what makes the pending `receive` completion handler
+            // actually fire so this task can finish instead of hanging.
             self.connection.cancel()
         }
     }
