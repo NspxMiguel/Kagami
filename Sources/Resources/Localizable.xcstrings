@@ -512,6 +512,22 @@
           }
         }
       }
+    },
+    "The stream fell too far behind live to catch up.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The stream fell too far behind live to catch up."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O fluxo ficou longe demais do tempo real para se recuperar."
+          }
+        }
+      }
     }
   },
   "version": "1.0"

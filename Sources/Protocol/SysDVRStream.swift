@@ -19,7 +19,12 @@ actor SysDVRStream {
         let header: SysDVR.PacketHeader
         let payload: Data
         var sequence = 0
-        let receivedAt = ContinuousClock.now
+        // `var` rather than `let` so the memberwise initializer accepts an override —
+        // Swift only synthesizes a default-valued init parameter for a property with an
+        // initial-value expression when it is mutable. Nothing in the pipeline mutates
+        // this after construction; tests use the override to build a packet as though
+        // it arrived at a specific synthetic instant, without a real sleep.
+        var receivedAt = ContinuousClock.now
     }
 
     enum Failure: LocalizedError {
@@ -30,6 +35,13 @@ actor SysDVRStream {
         case closed
         case timedOut
         case excessiveLatency
+        /// The pipeline fell further behind live than any amount of catch-up could fix
+        /// — see `VideoIngest.hardBacklogCeiling`. Fix 4 replaces the lateness-based
+        /// reconnect this enum used to have with a genuine dead-socket timeout; this one
+        /// case survives that change; it is not "data is late" but "so late that no
+        /// realistic amount of catch-up decoding fixes it," which stays a reconnect
+        /// reason even once the socket itself is proven alive.
+        case backlogExceeded
 
         var errorDescription: String? {
             switch self {
@@ -46,6 +58,8 @@ actor SysDVRStream {
                 return String(localized: "The console closed the connection.")
             case .excessiveLatency:
                 return "Stream latency exceeded the recovery budget."
+            case .backlogExceeded:
+                return String(localized: "The stream fell too far behind live to catch up.")
             case .timedOut:
                 return String(
                     localized: "The console did not respond. Check its address and Wi-Fi.")
@@ -154,9 +168,12 @@ actor SysDVRStream {
 
     /// Reads packets until the connection ends or the task is cancelled.
     func packets() -> AsyncThrowingStream<Packet, Error> {
-        // Bounded compressed queues. Sequence gaps tell the decoder to wait for an
-        // IDR rather than displaying P-frames whose reference was discarded.
-        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(3)) { continuation in
+        // Unbounded on purpose: over TCP the only way to lose an access unit is to drop
+        // it ourselves, and a dropped access unit is exactly what used to force a wait
+        // for the next keyframe. `sequence` is still assigned below, for diagnostics —
+        // it should now always come out contiguous, since nothing here discards a
+        // packet the console actually sent.
+        AsyncThrowingStream { continuation in
             let task = Task {
                 var sequence = 0
                 do {

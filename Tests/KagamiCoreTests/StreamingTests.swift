@@ -57,7 +57,11 @@ final class StreamingTests: XCTestCase, @unchecked Sendable {
         await stream.close()
     }
 
-    func testBurstKeepsOnlyRecentPackets() async throws {
+    /// The client never drops a compressed access unit itself any more — over TCP the
+    /// only loss is a decision made here, and every drop used to force a wait for the
+    /// next keyframe. A burst that arrives faster than it is consumed used to leave only
+    /// the newest 3; now every packet the peer sent comes out, in order.
+    func testBurstDeliversEveryPacketInOrder() async throws {
         var bytes = TestPeer.handshake
         for index in 0..<100 {
             bytes.append(littleEndian: SysDVR.PacketHeader.magic)
@@ -72,10 +76,15 @@ final class StreamingTests: XCTestCase, @unchecked Sendable {
         try await stream.connect()
         let packets = await stream.packets()
         try await Task.sleep(for: .milliseconds(300))
+        var received: [SysDVRStream.Packet] = []
         var iterator = packets.makeAsyncIterator()
-        let first = try await iterator.next()
-        XCTAssertTrue(first?.sequence == 97)
-        XCTAssertTrue(first?.payload == Data([97]))
+        for _ in 0..<100 {
+            guard let packet = try await iterator.next() else { break }
+            received.append(packet)
+        }
+        XCTAssertEqual(received.count, 100)
+        XCTAssertEqual(received.map(\.sequence), Array(0..<100))
+        XCTAssertEqual(received.map(\.payload), (0..<100).map { Data([UInt8($0)]) })
         await stream.close()
     }
 

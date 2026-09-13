@@ -11,7 +11,10 @@ let package = Package(
             exclude: [
                 "UI", "Resources", "Session.swift", "KagamiApp.swift", "Media/AudioOutput.swift",
             ],
-            sources: ["Protocol", "Media/VideoDecoder.swift", "Media/PipelineStats.swift"]),
+            sources: [
+                "Protocol", "Media/VideoDecoder.swift", "Media/PipelineStats.swift",
+                "Media/VideoIngest.swift",
+            ]),
         .testTarget(
             name: "KagamiCoreTests", dependencies: ["KagamiCore"],
             path: "Tests/KagamiCoreTests", resources: [.copy("Fixtures")]),
