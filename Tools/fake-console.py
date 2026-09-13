@@ -37,24 +37,39 @@ SAMPLE_RATE, CHANNELS = 48000, 2
 AUDIO_PAYLOAD = 0x1000
 
 
-def build_test_video(seconds: int) -> bytes:
-    """A moving colour pattern in Annex-B H.264, parameter sets on every keyframe."""
+def build_test_video(seconds: int, gop: int, motion: str, bitrate_kbps: int | None) -> bytes:
+    """A moving colour pattern in Annex-B H.264, parameter sets on every keyframe.
+
+    `gop` sets the IDR interval in frames (the real console's is unmeasured; the
+    plan's fixtures assume a long one). `motion="noise"` adds per-pixel noise on top
+    of the test pattern so P-frames carry real entropy instead of near-empty skip
+    blocks, closer to a busy game scene than the default flat pattern.
+    """
     out = os.path.join(tempfile.mkdtemp(), "pattern.h264")
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-f", "lavfi", "-i", f"testsrc2=size={WIDTH}x{HEIGHT}:rate={FPS}",
-         "-t", str(seconds),
-         "-c:v", "libx264", "-profile:v", "main", "-preset", "ultrafast",
-         "-tune", "zerolatency", "-g", str(FPS), "-pix_fmt", "yuv420p",
-         # Without this libx264's threaded encoder row-slices each picture — one NAL
-         # per thread, not per frame — and the access-unit splitter below would treat
-         # every slice as its own frame, corrupting the stream it hands to the client.
-         "-x264-params", "slices=1:sliced-threads=0",
-         # The console injects SPS/PPS ahead of each keyframe when the client asks;
-         # dump_extra is how ffmpeg reproduces that.
-         "-bsf:v", "dump_extra",
-         "-f", "h264", out],
-        check=True)
+    source = f"testsrc2=size={WIDTH}x{HEIGHT}:rate={FPS}"
+    if motion == "noise":
+        source += ",noise=alls=60:allf=t"
+    args = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", source,
+        "-t", str(seconds),
+        "-c:v", "libx264", "-profile:v", "main", "-preset", "ultrafast",
+        "-tune", "zerolatency", "-g", str(gop), "-pix_fmt", "yuv420p",
+    ]
+    if bitrate_kbps:
+        args += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k",
+                  "-bufsize", f"{bitrate_kbps}k"]
+    args += [
+        # Without this libx264's threaded encoder row-slices each picture — one NAL
+        # per thread, not per frame — and the access-unit splitter below would treat
+        # every slice as its own frame, corrupting the stream it hands to the client.
+        "-x264-params", "slices=1:sliced-threads=0",
+        # The console injects SPS/PPS ahead of each keyframe when the client asks;
+        # dump_extra is how ffmpeg reproduces that.
+        "-bsf:v", "dump_extra",
+        "-f", "h264", out,
+    ]
+    subprocess.run(args, check=True)
     return open(out, "rb").read()
 
 
@@ -162,14 +177,51 @@ def serve(port: int, worker, once: bool) -> None:
             return
 
 
+def next_stall_deadline(stall_every: float | None) -> float | None:
+    return stall_every if stall_every else None
+
+
+def apply_stall(elapsed: float, next_at: float | None, stall_ms: float, stall_every: float) -> float | None:
+    """Sleeps out one stall when `elapsed` reaches `next_at`, returns the next deadline.
+
+    The pacing loops below compute each send's target time as `start + n * period`
+    against the fixed origin `start`, never against the previous send. So a stall
+    sleep does not shift later targets — it just makes `time.monotonic()` run past
+    several of them at once, and the loop's own `max(0, target - now)` naturally
+    sends the whole backlog back to back once the stall ends. This is what
+    reproduces a Wi-Fi drain-and-burst without a separate burst code path.
+    """
+    if next_at is None or elapsed < next_at:
+        return next_at
+    time.sleep(stall_ms / 1000)
+    return next_at + stall_every
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=int, default=10, help="length of the loop")
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--gop", type=int, default=FPS,
+                         help="IDR interval in frames (default: 1s, matching the old fixture)")
+    parser.add_argument("--motion", choices=("plain", "noise"), default="plain",
+                         help="'noise' adds per-pixel entropy so P-frames are not near-empty")
+    parser.add_argument("--bitrate", type=int, default=6000, metavar="KBPS",
+                         help="caps the encoder to a target bitrate in kbps (default: 6000, "
+                              "close to the ~4.8 Mbps measured on real hardware; pass 0 for "
+                              "an uncapped encode). With --motion noise, an uncapped encode's "
+                              "IDR frames exceed SysDVRProtocol.maxPayloadSize (0x54000 "
+                              "bytes) because noise barely compresses, which the real client "
+                              "would also refuse as a corrupt packet")
+    parser.add_argument("--stall-ms", type=float, default=None,
+                         help="pause sending for this many ms every --stall-every seconds")
+    parser.add_argument("--stall-every", type=float, default=None,
+                         help="seconds between stalls; requires --stall-ms")
     args = parser.parse_args()
+    if (args.stall_ms is None) != (args.stall_every is None):
+        parser.error("--stall-ms and --stall-every must be given together")
 
     print("building test media with ffmpeg...")
-    frames = split_access_units(build_test_video(args.seconds))
+    frames = split_access_units(build_test_video(args.seconds, args.gop, args.motion, args.bitrate))
     tone = build_test_audio(args.seconds)
     print(f"{len(frames)} frames, {len(tone) // 1024} KiB of audio")
 
@@ -178,7 +230,10 @@ def main() -> int:
             return
         start = time.monotonic()
         index = 0
+        next_stall = next_stall_deadline(args.stall_every)
         while True:
+            if next_stall is not None:
+                next_stall = apply_stall(time.monotonic() - start, next_stall, args.stall_ms, args.stall_every)
             frame = frames[index % len(frames)]
             send_packet(conn, frame, FLAG_VIDEO, time.monotonic_ns() // 1000)
             index += 1
@@ -192,7 +247,10 @@ def main() -> int:
         start = time.monotonic()
         offset = 0
         chunks = 0
+        next_stall = next_stall_deadline(args.stall_every)
         while True:
+            if next_stall is not None:
+                next_stall = apply_stall(time.monotonic() - start, next_stall, args.stall_ms, args.stall_every)
             chunk = tone[offset:offset + AUDIO_PAYLOAD]
             if len(chunk) < AUDIO_PAYLOAD:
                 offset = 0

@@ -63,6 +63,11 @@ INTRA_PACKET_STALL_SEVERE_MS = 100.0
 INTER_ARRIVAL_GAP_MS = 100.0
 INTER_ARRIVAL_GAP_SEVERE_MS = 200.0
 
+# Bucket edges for the inter-arrival stall histogram, in ms. Sized to separate normal
+# jitter (well under 50ms at 30fps) from a deliberate Tools/fake-console.py
+# --stall-ms pause (typically hundreds of ms) without needing a config flag here.
+STALL_HISTOGRAM_BUCKETS_MS = (50.0, 100.0, 300.0, 600.0)
+
 
 @dataclass
 class Chunk:
@@ -289,30 +294,50 @@ def summarize(result: StreamResult) -> None:
             f"gaps>100ms: {gaps_100}  gaps>200ms: {gaps_200}"
         )
 
-    # Excess delay: (arrival - timestamp) normalized so the best-case packet in
-    # this run reads as zero. The console clock and this Mac's monotonic clock
-    # have no common epoch, so only the *shape* of this offset over time is
-    # meaningful, not its absolute value.
+        # Stall histogram: a deliberate Tools/fake-console.py --stall-ms pause shows up
+        # here as a handful of gaps in the hundreds-of-ms buckets, distinct from normal
+        # frame-to-frame jitter (well under 50ms at 30fps). Counts, not percentages,
+        # because a 15s capture may only contain 2-3 stalls total.
+        edges = STALL_HISTOGRAM_BUCKETS_MS
+        counts = [0] * (len(edges) + 1)
+        for g in inter_ms:
+            bucket = 0
+            while bucket < len(edges) and g > edges[bucket]:
+                bucket += 1
+            counts[bucket] += 1
+        labels = [f"<{edges[0]:.0f}"]
+        labels += [f"{edges[i]:.0f}-{edges[i + 1]:.0f}" for i in range(len(edges) - 1)]
+        labels.append(f">{edges[-1]:.0f}")
+        histogram = "  ".join(f"{label}ms:{count}" for label, count in zip(labels, counts))
+        print(f"  stall histogram (inter-arrival gaps) -- {histogram}")
+
+    # receiveBacklog: (arrival - timestamp) normalized so the best-case packet in this
+    # run reads as zero -- the same quantity PipelineStats.receiveBacklogMillis names
+    # in the app (how far behind the console's own clock this packet arrived). The
+    # console clock and this Mac's monotonic clock have no common epoch, so only the
+    # *shape* of this offset over time is meaningful, not its absolute value. Still
+    # labeled with the app's old fixed drop thresholds below for reference, even
+    # though the app no longer reconnects on lateness alone (see fix step 4).
     offsets_s = [(p.arrival_ns / 1e9) - (p.timestamp_us / 1e6) for p in packets]
     floor = min(offsets_s)
-    excess_ms = sorted((o - floor) * 1000 for o in offsets_s)
+    backlog_ms = sorted((o - floor) * 1000 for o in offsets_s)
     threshold_ms = (
         AUDIO_DROP_THRESHOLD_MS
         if any(p.flags & PKT_FLAG_AUDIO for p in packets)
         and not any(p.flags & PKT_FLAG_VIDEO for p in packets)
         else VIDEO_DROP_THRESHOLD_MS
     )
-    over_80 = sum(1 for e in excess_ms if e > AUDIO_DROP_THRESHOLD_MS)
-    over_120 = sum(1 for e in excess_ms if e > VIDEO_DROP_THRESHOLD_MS)
+    over_80 = sum(1 for e in backlog_ms if e > AUDIO_DROP_THRESHOLD_MS)
+    over_120 = sum(1 for e in backlog_ms if e > VIDEO_DROP_THRESHOLD_MS)
     print(
-        f"  excess delay ms -- p50 {percentile(excess_ms, 50):.1f}  "
-        f"p95 {percentile(excess_ms, 95):.1f}  p99 {percentile(excess_ms, 99):.1f}  "
-        f"max {max(excess_ms):.1f}"
+        f"  receiveBacklog ms -- p50 {percentile(backlog_ms, 50):.1f}  "
+        f"p95 {percentile(backlog_ms, 95):.1f}  p99 {percentile(backlog_ms, 99):.1f}  "
+        f"max {max(backlog_ms):.1f}"
     )
     print(
-        f"  excess delay over 80ms: {over_80} ({100 * over_80 / len(excess_ms):.1f}%)  "
-        f"over 120ms: {over_120} ({100 * over_120 / len(excess_ms):.1f}%)  "
-        f"[this stream's app drop threshold is {threshold_ms:.0f}ms]"
+        f"  receiveBacklog over 80ms: {over_80} ({100 * over_80 / len(backlog_ms):.1f}%)  "
+        f"over 120ms: {over_120} ({100 * over_120 / len(backlog_ms):.1f}%)  "
+        f"[app's old fixed drop threshold was {threshold_ms:.0f}ms]"
     )
 
     stall_40 = 0
