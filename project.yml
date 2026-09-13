@@ -11,6 +11,13 @@ targets:
     platform: visionOS
     sources:
       - path: Sources
+    preBuildScripts:
+      - name: Stamp build info
+        script: |
+          "$SRCROOT/Tools/stamp-build.sh"
+        # No declared output: the script must run on every build, not just when
+        # xcodegen thinks its inputs changed.
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kagami.app

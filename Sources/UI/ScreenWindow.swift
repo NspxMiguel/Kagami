@@ -46,6 +46,11 @@ struct ScreenWindow: View {
 
     private var controls: some View {
         HStack(spacing: 18) {
+            if let build = BuildInfo.current {
+                buildStamp(build)
+                Divider().frame(height: 22)
+            }
+
             frameRate
 
             Divider().frame(height: 22)
@@ -95,6 +100,15 @@ struct ScreenWindow: View {
             await dismissSpace()
             session.theaterOpen = false
         }
+    }
+
+    /// Which commit this build was made from — small and secondary, so it never
+    /// competes with the controls someone actually touches.
+    private func buildStamp(_ build: BuildInfo) -> some View {
+        Text(String(localized: "Build \(build.revision)"))
+            .font(Design.counter)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("buildStampLabel")
     }
 
     /// Uses the video renderer's displayed-frame metrics, excluding dropped frames.
