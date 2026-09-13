@@ -125,6 +125,11 @@ final class VideoPump: @unchecked Sendable {
     func stop() {
         requesting.withLock { $0 = false }
         renderer.stopRequestingMediaData()
+        // Unregister from the slot too, not just the renderer: a `write()` landing
+        // between this teardown and any later `attach()` would otherwise call back into
+        // `frameAvailable()` and re-arm `requestMediaDataWhenReady` on a renderer this
+        // pump no longer owns.
+        slot.setDidWrite(nil)
     }
 
     /// Runs on `queue`. Drains the slot for as long as the renderer wants more, then
