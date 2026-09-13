@@ -9,10 +9,15 @@ final class DecodedVideo {
     private(set) var frame: CVPixelBuffer?
     private(set) var framesPresented = 0
     weak var surface: VideoSurfaceView?
+    var stats: PipelineStats?
 
     func publish(_ buffer: CVPixelBuffer) {
         frame = buffer
-        if surface?.present(buffer) == true { framesPresented += 1 }
+        if surface?.present(buffer) == true {
+            framesPresented += 1
+        } else if surface != nil {
+            stats?.increment(\.rendererNotReady)
+        }
     }
 
     func reset() {

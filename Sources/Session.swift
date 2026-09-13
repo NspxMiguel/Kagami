@@ -12,8 +12,13 @@ final class Session {
     }
 
     private let log = Logger(subsystem: "com.kagami.app", category: "session")
+    private let diagnosticsLog = Logger(subsystem: "com.kagami.app", category: "diagnostics")
     private(set) var state: State = .idle
     let decoder = DecodedVideo()
+    // Sendable and touched from the nonisolated receive loops below on every packet —
+    // isolating it to the main actor would reintroduce the very per-packet main-actor
+    // hop this rewrite exists to remove.
+    nonisolated let stats = PipelineStats()
     var ambientComponents: (r: Double, g: Double, b: Double) = (0, 0, 0)
     var theaterOpen = false
     var theaterTransitioning = false
@@ -41,6 +46,7 @@ final class Session {
         host = defaults.string(forKey: "console.host") ?? ""
         playAudio = defaults.object(forKey: "console.audio") as? Bool ?? true
         turnOffConsoleScreen = defaults.object(forKey: "console.blankScreen") as? Bool ?? false
+        decoder.stats = stats
     }
 
     var isRunning: Bool {
@@ -58,6 +64,7 @@ final class Session {
         let token = generation
         let blankScreen = turnOffConsoleScreen
         decoder.reset()
+        stats.reset()
         framesPerSecond = 0
         state = .connecting
         videoTask = Task { await runVideo(host: target, blankScreen: blankScreen, token: token) }
@@ -100,6 +107,7 @@ final class Session {
                 presentation = Task { @MainActor in
                     for await frame in worker.frames {
                         guard !Task.isCancelled, self.generation == token else { break }
+                        self.stats.increment(\.framesDecoded)
                         guard frame.decodedAt.duration(to: .now) < .milliseconds(100) else {
                             continue
                         }
@@ -111,6 +119,11 @@ final class Session {
                 var previousSequence = -1
                 var timeline = StreamTimeline()
                 var stalePackets = 0
+                // Edge-triggered so a whole run of stale packets in one stall counts as
+                // one wait, not one per packet — mirrors the decoder's own
+                // waitingForKeyframe flag without an extra actor round trip to read it.
+                var awaitingKeyframe = false
+                var keyframeWaitStartedAt: ContinuousClock.Instant?
                 for try await packet in await stream.packets() {
                     try Task.checkCancellation()
                     if packet.header.flags.contains(.error) {
@@ -119,23 +132,49 @@ final class Session {
                         continue
                     }
                     guard !packet.payload.isEmpty else { continue }
+                    stats.increment(\.packetsReceived)
+                    stats.increment(\.bytesReceived, by: packet.payload.count)
                     if packet.sequence != previousSequence + 1 {
+                        stats.increment(
+                            \.compressedDropped, by: max(0, packet.sequence - previousSequence - 1))
+                        if !awaitingKeyframe {
+                            awaitingKeyframe = true
+                            keyframeWaitStartedAt = .now
+                            stats.increment(\.keyframeWaitsEntered)
+                        }
                         await worker.recoverAfterDrop()
                     }
                     previousSequence = packet.sequence
                     let transportDelay = timeline.excessDelay(
                         timestampMicros: packet.header.timestamp,
                         receivedAt: packet.receivedAt)
+                    stats.set(\.receiveBacklogMillis, to: milliseconds(transportDelay))
                     guard transportDelay + packet.receivedAt.duration(to: .now) < .milliseconds(120)
                     else {
+                        if !awaitingKeyframe {
+                            awaitingKeyframe = true
+                            keyframeWaitStartedAt = .now
+                            stats.increment(\.keyframeWaitsEntered)
+                        }
                         await worker.recoverAfterDrop()
                         stalePackets += 1
                         if stalePackets >= 30 { throw SysDVRStream.Failure.excessiveLatency }
                         continue
                     }
                     stalePackets = 0
-                    try await worker.decode(
-                        packet.payload, timestampMicros: packet.header.timestamp)
+                    if awaitingKeyframe, let startedAt = keyframeWaitStartedAt {
+                        stats.increment(\.keyframeWaitMillisTotal, by: milliseconds(startedAt.duration(to: .now)))
+                    }
+                    awaitingKeyframe = false
+                    keyframeWaitStartedAt = nil
+                    stats.increment(\.decodeCalls)
+                    do {
+                        try await worker.decode(
+                            packet.payload, timestampMicros: packet.header.timestamp)
+                    } catch {
+                        stats.increment(\.decodeErrors)
+                        throw error
+                    }
                     retry = 0
                 }
             } catch {
@@ -161,6 +200,7 @@ final class Session {
                 return
             }
             await setState(.reconnecting, token: token)
+            stats.increment(\.reconnects)
             retry = min(retry + 1, 4)
             do { try await Task.sleep(for: .milliseconds(retry == 1 ? 300 : retry * 1000)) } catch {
                 return
@@ -178,6 +218,8 @@ final class Session {
                 for try await packet in await stream.packets() {
                     try Task.checkCancellation()
                     guard !packet.payload.isEmpty, !packet.header.flags.contains(.error) else { continue }
+                    stats.increment(\.packetsReceived)
+                    stats.increment(\.bytesReceived, by: packet.payload.count)
                     let transportDelay = timeline.excessDelay(
                         timestampMicros: packet.header.timestamp,
                         receivedAt: packet.receivedAt)
@@ -198,6 +240,7 @@ final class Session {
             }
             await stream.close()
             guard !Task.isCancelled else { return }
+            stats.increment(\.reconnects)
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
         }
     }
@@ -229,11 +272,8 @@ final class Session {
                 }
                 previousCount = count
                 previousTime = now
-                if UserDefaults.standard.bool(forKey: "streamDiagnostics") {
-                    print(
-                        "video: displayedFPS=\(framesPerSecond), submitted=\(decoder.framesPresented), displayed=\(count ?? 0)"
-                    )
-                }
+                if let count { stats.set(\.framesDisplayed, to: count) }
+                logDiagnosticsIfEnabled(framesDisplayedPerSecond: framesPerSecond)
                 if state == .streaming, lastFrameAt.duration(to: now) > .seconds(2) {
                     state = .waitingForGame
                     ambientComponents = (0, 0, 0)
@@ -246,5 +286,15 @@ final class Session {
         guard generation == token else { return }
         disconnect()
         state = .failed(message)
+    }
+
+    /// One compact JSON line per second describing the whole pipeline, gated behind
+    /// `-streamDiagnostics YES` so it costs nothing in normal use. Later stages read
+    /// it back with `log show --predicate 'subsystem == "com.kagami.app" AND
+    /// category == "diagnostics"'` instead of eyeballing the on-screen fps counter.
+    private func logDiagnosticsIfEnabled(framesDisplayedPerSecond: Int) {
+        guard UserDefaults.standard.bool(forKey: "streamDiagnostics") else { return }
+        let line = stats.snapshot().diagnosticsLine(framesDisplayedPerSecond: framesDisplayedPerSecond)
+        diagnosticsLog.log("\(line, privacy: .public)")
     }
 }
