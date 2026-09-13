@@ -18,10 +18,13 @@ targets:
           # keeps the generated project the same whether or not the gitignored
           # source-tree copy happens to exist when `xcodegen generate` runs.
           - "Resources/BuildInfo.json"
-    preBuildScripts:
+    postBuildScripts:
       - name: Stamp build info
         script: |
           "$SRCROOT/Tools/stamp-build.sh"
+        # Runs after CodeSign (postBuildScripts run last) and re-signs the bundle
+        # itself once it has written BuildInfo.json into it — see the long comment
+        # at the top of stamp-build.sh for why this can't be a preBuildScript.
         # No declared output: the script must run on every build, not just when
         # xcodegen thinks its inputs changed.
         basedOnDependencyAnalysis: false

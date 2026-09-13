@@ -8,8 +8,8 @@
 # Two copies are written, because they serve two different readers:
 #
 # 1. Sources/Resources/BuildInfo.json — the source-tree copy. It is gitignored and
-#    regenerated on every build (see the risk note in the fix plan: a preBuildScript
-#    must not dirty the tree). `bash Tools/stamp-build.sh` alone, outside Xcode, still
+#    regenerated on every build (see the risk note in the fix plan: this script must
+#    not dirty the tree). `bash Tools/stamp-build.sh` alone, outside Xcode, still
 #    produces this file, which is what the plan's acceptance check and any tooling
 #    that just wants the commit string reads.
 #
@@ -24,9 +24,24 @@
 #    created for it, and no later run of this script can retroactively add one — the
 #    stamp would silently never appear in the app. Writing directly into the product
 #    folder sidesteps that: it does not depend on the file existing, or on xcodegen,
-#    at project-generation time at all. This preBuildScript runs before Compile
-#    Sources and well before CodeSign, so the file is present when the bundle gets
-#    signed.
+#    at project-generation time at all.
+#
+# This runs as a postBuildScript — AFTER Xcode's own CodeSign step, not before it —
+# and re-signs the bundle itself once it is done writing. That is deliberate, not
+# an oversight: an earlier version ran this as a preBuildScript (before Compile/
+# Link/CodeSign), reasoning that writing the file early would let Xcode's normal
+# CodeSign phase seal it along with everything else. That held on a full build, but
+# broke on the very next incremental build with zero source changes: Xcode's build
+# graph has no file reference for this resource (see the exclude in project.yml), so
+# its dependency analysis sees nothing to re-sign and skips CodeSign entirely — yet
+# this script is `basedOnDependencyAnalysis: false` and still overwrote the file
+# (new builtAt timestamp) underneath the seal computed on the previous build.
+# `codesign --verify --deep --strict` then fails with "a sealed resource is missing
+# or invalid", invisible in `simctl install`/`launch` (which don't enforce a strict
+# seal check) but very much enforced by `xcrun devicectl device install app` on a
+# physical Vision Pro. Running after CodeSign and re-signing ourselves, every time,
+# sidesteps Xcode's dependency analysis altogether: we never rely on it deciding to
+# re-run CodeSign for us.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,4 +77,16 @@ if [[ -n "${CODESIGNING_FOLDER_PATH:-}" ]]; then
   product_copy="$CODESIGNING_FOLDER_PATH/BuildInfo.json"
   printf '%s\n' "$json" > "$product_copy"
   echo "stamped $product_copy: commit=$commit dirty=$dirty builtAt=$built_at"
+
+  # Re-seal the bundle now that we changed a file inside it after CodeSign already
+  # ran. Skip quietly when signing is off (CODE_SIGNING_ALLOWED=NO, e.g. some
+  # analysis-only invocations) or when there is no identity to sign with yet.
+  if [[ "${CODE_SIGNING_ALLOWED:-YES}" == "YES" && -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+    resign_args=(--force --sign "$EXPANDED_CODE_SIGN_IDENTITY")
+    if [[ -n "${CODE_SIGN_ENTITLEMENTS:-}" && -f "${CODE_SIGN_ENTITLEMENTS}" ]]; then
+      resign_args+=(--entitlements "$CODE_SIGN_ENTITLEMENTS")
+    fi
+    /usr/bin/codesign "${resign_args[@]}" "$CODESIGNING_FOLDER_PATH"
+    echo "re-signed $CODESIGNING_FOLDER_PATH after stamping BuildInfo.json"
+  fi
 fi
