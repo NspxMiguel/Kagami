@@ -1,4 +1,5 @@
 import CoreVideo
+import Dispatch
 import Foundation
 import Synchronization
 
@@ -20,7 +21,10 @@ final class LatestFrameSlot: Sendable {
 
     private let pending = Mutex<Frame?>(nil)
     private let statsBox = Mutex<PipelineStats?>(nil)
-    private let onWriteBox = Mutex<(@Sendable () -> Void)?>(nil)
+    /// The reader's wake source, created once when a reader attaches. `write()` only
+    /// ever merges a data value into it — see `attachReader` for why that, and not a
+    /// plain callback, is what makes the wake-up structurally safe.
+    private let wakeSource = Mutex<(any DispatchSourceUserDataAdd)?>(nil)
     /// The one connection attempt currently allowed to write into this slot. A `write`
     /// tagged with any other generation is silently dropped.
     ///
@@ -55,9 +59,52 @@ final class LatestFrameSlot: Sendable {
 
     /// Registers the one reader that should be woken whenever a frame lands in an empty
     /// slot. There is only ever one consumer of a given slot (the display layer's own
-    /// pump), so a single callback — not a list of observers — is enough.
-    func setDidWrite(_ callback: (@Sendable () -> Void)?) {
-        onWriteBox.withLock { $0 = callback }
+    /// pump), so a single wake source — not a list of observers — is enough.
+    ///
+    /// This — not a plain `@Sendable () -> Void` callback that `write()` calls directly —
+    /// is deliberate, and is the fix for a real SIGBUS ("Thread stack size exceeded due
+    /// to excessive recursion") that took down every decoded frame after ~280 s of
+    /// streaming. The previous design let `write()` invoke an arbitrary closure
+    /// synchronously, on whichever thread decoded the frame, every single time; nothing
+    /// stopped that closure from doing something that does not return in bounded stack —
+    /// and it did: the registered closure called `DispatchQueue.async`, whose defaulted
+    /// `flags:` parameter goes through Swift's generic-metadata cache, which under the
+    /// contention of dozens of near-simultaneous first-time lookups (one per decoded
+    /// frame, forever) recursed instead of returning. Wrapping that same call in another
+    /// layer of dispatch (the fix attempted before this one) did not help, because the
+    /// crash was in evaluating the *call* to `.async`, not in anything that ran after it.
+    ///
+    /// `attachReader` removes the recursion by construction rather than by convention:
+    /// `write()` below never again calls into caller-supplied code on the producer's own
+    /// stack. It only ever merges a value into a `DispatchSourceUserDataAdd` — a lock-free
+    /// atomic accumulate with no closures and no defaulted generic parameters to resolve
+    /// per call — and GCD guarantees that merging into a source never runs its handler
+    /// inline on the calling thread; the handler always runs later, on `queue`, and event
+    /// delivery is coalesced (a source that already has unread data caches the new value
+    /// instead of double-scheduling) so a burst of writes wakes the reader at least once
+    /// without ever losing a wake. The one-time cost of resolving `DispatchQueue`'s own
+    /// defaulted-argument overloads happens here, once, in `attachReader` — off the hot
+    /// path entirely — instead of racing on every decoded frame.
+    ///
+    /// Call once per reader lifetime (typically from the consumer's own `init`), not per
+    /// frame.
+    func attachReader(onQueue queue: DispatchQueue, wake handler: @escaping @Sendable () -> Void) {
+        let source = DispatchSource.makeUserDataAddSource(queue: queue)
+        source.setEventHandler(handler: handler)
+        source.activate()
+        wakeSource.withLock { previous in
+            previous?.cancel()
+            previous = source
+        }
+    }
+
+    /// Detaches the current reader, if any, so a later `write()` stops signalling a
+    /// source whose owner has gone away.
+    func detachReader() {
+        wakeSource.withLock { source in
+            source?.cancel()
+            source = nil
+        }
     }
 
     /// Overwrites whatever frame is waiting, but only if `generation` is still the one
@@ -73,7 +120,7 @@ final class LatestFrameSlot: Sendable {
             return had
         }
         if hadPending { statsBox.withLock { $0 }?.increment(\.framesSuperseded) }
-        onWriteBox.withLock { $0 }?()
+        wakeSource.withLock { $0 }?.add(data: 1)
     }
 
     /// Takes the pending frame, if any, leaving the slot empty.

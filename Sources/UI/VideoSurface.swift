@@ -116,18 +116,11 @@ final class VideoPump: @unchecked Sendable {
     init(renderer: AVSampleBufferVideoRenderer, slot: LatestFrameSlot) {
         self.renderer = renderer
         self.slot = slot
-        // Hops onto `queue` before calling `frameAvailable()`, rather than invoking it
-        // inline on whichever thread called `write()` (the presentation `Task`, on
-        // Swift's cooperative pool). `frameAvailable()` can call all the way through
-        // `requestMediaDataWhenReadyOnQueue` into `AVMediaDataRequester`, and running
-        // that chain nested inside the calling `Task`'s own async continuation, once per
-        // decoded frame for as long as the stream runs, grows the native stack by a
-        // couple of frames every time and never releases them — confirmed on device by
-        // a SIGBUS ("Thread stack size exceeded due to excessive recursion") after about
-        // 280 s / 8300 decoded frames, with a recursion depth almost exactly 2x the
-        // frame count. Dispatching here means `write()` always returns immediately and
-        // `frameAvailable()` starts on a fresh stack on `queue`'s own thread instead.
-        slot.setDidWrite { [weak self] in self?.queue.async { self?.frameAvailable() } }
+        // See `LatestFrameSlot.attachReader` for why this — and not a plain closure that
+        // `write()` calls directly — is what keeps a decoded frame's producer from ever
+        // recursing into this pump on its own native stack. `frameAvailable` runs later,
+        // on `queue`, once per coalesced wake, never inline on the writer's thread.
+        slot.attachReader(onQueue: queue) { [weak self] in self?.frameAvailable() }
     }
 
     var latestPresentedTimestampMicros: UInt64? { lastPresentedTimestamp.withLock { $0 } }
@@ -148,11 +141,10 @@ final class VideoPump: @unchecked Sendable {
     func stop() {
         requesting.withLock { $0 = false }
         renderer.stopRequestingMediaData()
-        // Unregister from the slot too, not just the renderer: a `write()` landing
-        // between this teardown and any later `attach()` would otherwise call back into
-        // `frameAvailable()` and re-arm `requestMediaDataWhenReady` on a renderer this
-        // pump no longer owns.
-        slot.setDidWrite(nil)
+        // Detach from the slot too, not just the renderer: a `write()` landing between
+        // this teardown and any later `attach()` would otherwise wake `frameAvailable()`
+        // and re-arm `requestMediaDataWhenReady` on a renderer this pump no longer owns.
+        slot.detachReader()
     }
 
     /// Runs on `queue`. Drains the slot for as long as the renderer wants more, then
