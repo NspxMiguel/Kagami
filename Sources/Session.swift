@@ -116,15 +116,30 @@ final class Session {
     /// a truly gone console does not make the UI wait much longer than that per attempt.
     private nonisolated static let reconnectBackoffMillis = [300, 1000, 2000]
 
+    /// Backoff specifically for a reconnect triggered by `VideoIngest`'s self-heal
+    /// giving up on the decoder entirely (`SysDVRStream.Failure.decoderWedged`), as
+    /// opposed to an ordinary dropped connection. Deliberately much longer than
+    /// `reconnectBackoffMillis`: the socket itself is not the problem here (the
+    /// console answered fine), what is suspected to need time is whatever hardware or
+    /// software video-decode resource left `H264Decoder` unable to produce a single
+    /// frame no matter how many times it rebuilds its session. Grows only across
+    /// consecutive wedge-driven reconnects that themselves decode nothing before
+    /// wedging again — one that does produce even a single frame is real progress and
+    /// resets the schedule, the same way an ordinary healthy packet resets `retry`.
+    private nonisolated static let decoderWedgeBackoffMillis = [1_000, 3_000, 8_000, 15_000]
+
     nonisolated private func runVideo(
         host: String, blankScreen: Bool, token: UUID, slot: LatestFrameSlot
     ) async {
         var retry = 0
+        var consecutiveWedgesWithNoProgress = 0
         while !Task.isCancelled {
             let stream = SysDVRStream(host: host, kind: .video, turnOffConsoleScreen: blankScreen)
             let ingest = VideoIngest(stats: stats)
             var presentation: Task<Void, Never>?
             var terminalError: String?
+            var wasWedged = false
+            let framesDecodedBeforeAttempt = stats.snapshot().framesDecoded
             do {
                 try await stream.connect()
                 try Task.checkCancellation()
@@ -163,6 +178,8 @@ final class Session {
                         switch failure {
                         case .notSysDVR, .unsupportedVersion, .rejected:
                             terminalError = error.localizedDescription
+                        case .decoderWedged:
+                            wasWedged = true
                         default: break
                         }
                     }
@@ -183,9 +200,24 @@ final class Session {
             // one.
             await setState(.reconnecting, token: token)
             stats.increment(\.reconnects)
-            retry = min(retry + 1, Self.reconnectBackoffMillis.count)
+            let madeProgress = stats.snapshot().framesDecoded > framesDecodedBeforeAttempt
+            let waitMillis: Int
+            if wasWedged {
+                consecutiveWedgesWithNoProgress = madeProgress ? 0 : consecutiveWedgesWithNoProgress + 1
+                // A wedge-driven reconnect starts the ordinary network backoff over
+                // too: whatever comes after this is a fresh problem, not a
+                // continuation of a socket that was already flaky.
+                retry = 0
+                let index = min(
+                    max(0, consecutiveWedgesWithNoProgress - 1), Self.decoderWedgeBackoffMillis.count - 1)
+                waitMillis = Self.decoderWedgeBackoffMillis[index]
+            } else {
+                consecutiveWedgesWithNoProgress = 0
+                retry = min(retry + 1, Self.reconnectBackoffMillis.count)
+                waitMillis = Self.reconnectBackoffMillis[retry - 1]
+            }
             do {
-                try await Task.sleep(for: .milliseconds(Self.reconnectBackoffMillis[retry - 1]))
+                try await Task.sleep(for: .milliseconds(waitMillis))
             } catch {
                 return
             }
