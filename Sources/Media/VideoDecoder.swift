@@ -345,6 +345,24 @@ actor H264Decoder {
         keyframeWaitStartedAt = .now
         stats?.increment(\.keyframeWaitsEntered)
         epoch.withLock { $0 &+= 1 }
+        // A decode failure means this exact session may be the problem, not only the
+        // bitstream — most notably, a single long-lived `VTDecompressionSession` can
+        // only decode roughly 16k access units before VideoToolbox starts
+        // synchronously rejecting every submission with `kVTVideoDecoderMalfunctionErr`
+        // (measured directly against this decoder; see VideoIngestTests). Tearing the
+        // session down here, on every path that declares the reference chain broken —
+        // not only when the parameter sets themselves changed — guarantees `decode`'s
+        // rebuild guard (`session == nil && parsed.isKeyframe`) actually fires on the
+        // very next keyframe. Without this, SysDVR re-sending byte-identical SPS/PPS
+        // ahead of every keyframe meant `parametersChanged` never fired again once the
+        // first session existed, so every later IDR just resubmitted to the same
+        // already-wedged session, which rejected it identically — forever, once per
+        // incoming keyframe.
+        if let session {
+            VTDecompressionSessionInvalidate(session)
+            self.session = nil
+        }
+        format = nil
     }
 
     private func endKeyframeWaitIfNeeded() {
