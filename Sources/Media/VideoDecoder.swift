@@ -47,14 +47,6 @@ actor H264Decoder {
     /// this decoder itself already declared suspect.
     private let epoch = Mutex<UInt64>(0)
 
-    /// How many session rebuilds in a row have gone straight back into a keyframe
-    /// wait with no successful decode in between — i.e. how many times a *freshly
-    /// rebuilt* session has itself immediately turned out to be no better than the
-    /// one it replaced. Reset to zero the moment any access unit actually decodes.
-    /// `rebuildSession()` reads this to grow the delay before creating each
-    /// replacement session; see its own header for why that delay exists at all.
-    private var consecutiveMalfunctions = 0
-
     init(stats: PipelineStats? = nil) {
         self.stats = stats
         let channel = AsyncStream<DecodedFrame>.makeStream(bufferingPolicy: .bufferingNewest(1))
@@ -241,11 +233,6 @@ actor H264Decoder {
         }
         switch outcome {
         case .success:
-            // A real decode went through: whatever run of consecutive rebuild
-            // failures might have been building up is over, and the next one (if
-            // there ever is one) starts its backoff from scratch, not from where a
-            // now-resolved streak left off.
-            consecutiveMalfunctions = 0
             return frame
         case .rejectedSynchronously(let status):
             await enterKeyframeWait()
@@ -356,13 +343,6 @@ actor H264Decoder {
         guard !waitingForKeyframe else { return }
         waitingForKeyframe = true
         keyframeWaitStartedAt = .now
-        // Counts this exact malfunction, not this exact rebuild attempt: bumped here,
-        // unconditionally, on every fresh break in the reference chain, and only ever
-        // cleared by an actual successful decode (`submit`'s `.success` case) — never
-        // by `rebuildSession` itself, since a rebuild that turns out to be no better
-        // is precisely the case this exists to slow down. See `rebuildSession`'s own
-        // header for what it does with this count.
-        consecutiveMalfunctions += 1
         stats?.increment(\.keyframeWaitsEntered)
         epoch.withLock { $0 &+= 1 }
         // A decode failure means this exact session may be the problem, not only the
@@ -430,23 +410,6 @@ actor H264Decoder {
         }
     }
 
-    /// How long to wait before actually creating a replacement session, based on how
-    /// many rebuilds in a row have gone straight back into a keyframe wait with no
-    /// successful decode in between. A single bad access unit or a one-off
-    /// VideoToolbox hiccup — the overwhelmingly common case — still rebuilds and
-    /// recovers on the very next keyframe with no perceptible delay: nothing about
-    /// today's behaviour changes for it. Only a rebuild that is ITSELF still failing,
-    /// back to back, grows the wait — the one signal available from inside this
-    /// decoder that recreating the session object is not, by itself, fixing whatever
-    /// is actually wrong, and that whatever shared resource is involved may need real
-    /// wall-clock time rather than another instant retry.
-    private func sessionRebuildDelay() -> Duration {
-        guard consecutiveMalfunctions > 1 else { return .zero }
-        let stepsMillis = [250, 500, 1_000, 2_000, 4_000]
-        let index = min(consecutiveMalfunctions - 2, stepsMillis.count - 1)
-        return .milliseconds(stepsMillis[index])
-    }
-
     private func rebuildSession() async throws {
         if let session { invalidate(session) }
         session = nil
@@ -458,13 +421,26 @@ actor H264Decoder {
         // `waitingForKeyframe` stale while `session` is nil.
         await enterKeyframeWait()
 
-        let delay = sessionRebuildDelay()
-        if delay > .zero {
-            log.notice(
-                "delaying session rebuild \(milliseconds(delay))ms after \(self.consecutiveMalfunctions) consecutive malfunctions"
-            )
-            try? await Task.sleep(for: delay)
-        }
+        // Deliberately no backoff before rebuilding: a decode error followed by an
+        // IDR must recover on that IDR, not several seconds later. An earlier attempt
+        // added a growing delay here on the theory that a session which fails
+        // immediately after being rebuilt might need real wall-clock time before a
+        // replacement can work — but that delay ran *inside* this call, which
+        // `VideoIngest.accept` awaits directly from `Session.runVideo`'s per-packet
+        // loop. Once several IDRs in a row kept failing, the delay grew to multiple
+        // seconds, which blocked that loop from draining the socket for that long,
+        // which made the next packet's `receiveBacklogMillis` look like the
+        // *connection* had fallen behind — tripping `VideoIngest.hardBacklogCeiling`
+        // and forcing an ordinary reconnect that had nothing to do with the real
+        // problem. That reconnect, in turn, was not tagged `.decoderWedged`, so it
+        // reset `Session.runVideo`'s own give-up counter every time — which is why a
+        // soak measured 19-21 reconnects with the pipeline never once concluding it
+        // should stop trying. If the underlying cause is transient, rebuilding
+        // immediately recovers on the very next keyframe with no perceptible delay,
+        // exactly like a single bad access unit always has. If it is not transient,
+        // no amount of waiting here was ever going to fix it — see
+        // `VideoIngest.selfHealIfWedged` and `Session.runVideo`'s own backoff for the
+        // policy that actually bounds a failure that keeps recurring.
 
         // The parameter sets must stay alive and contiguous for the duration of the
         // call, and CoreMedia wants non-optional pointers — hence the manual allocation
