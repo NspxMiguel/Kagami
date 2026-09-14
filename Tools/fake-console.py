@@ -177,6 +177,10 @@ def listening_socket(port: int) -> socket.socket:
 
 
 def serve(server: socket.socket, worker, once: bool) -> None:
+    # `listening_socket` no longer takes a port here (it already bound and listened
+    # on one) — read it back off the socket itself rather than threading it through
+    # as a second parameter that would just duplicate what `server` already knows.
+    port = server.getsockname()[1]
     while True:
         conn, address = server.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
