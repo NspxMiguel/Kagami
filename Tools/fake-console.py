@@ -183,9 +183,20 @@ def serve(server: socket.socket, worker, once: bool) -> None:
     port = server.getsockname()[1]
     while True:
         conn, address = server.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        print(f"[{port}] client from {address[0]}")
         try:
+            # A real client can open and immediately tear down a probe connection
+            # ahead of its real one (observed from an actual visionOS Simulator
+            # client, not just this script's own tests: Network.framework appears to
+            # do exactly this against a freshly-listening loopback socket). By the
+            # time this thread gets to `setsockopt` the peer may already be gone,
+            # and macOS reports that as `OSError: [Errno 22] Invalid argument` on
+            # `TCP_NODELAY` — not the `ConnectionError` one might expect — rather
+            # than at `accept()` itself. Catching it here, inside the per-connection
+            # try, keeps that one connection's failure from taking the whole
+            # accept-loop thread down with it (an uncaught exception here used to
+            # kill `serve()` entirely, silently ending this port forever).
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print(f"[{port}] client from {address[0]}")
             wants_video, wants_audio = handshake(conn)
             worker(conn, wants_video, wants_audio)
         except (ConnectionError, OSError, ValueError) as error:
