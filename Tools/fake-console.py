@@ -155,13 +155,28 @@ def send_packet(
     conn.sendall(header + payload)
 
 
-def serve(port: int, worker, once: bool) -> None:
+def listening_socket(port: int) -> socket.socket:
+    """Binds and listens immediately, separately from accepting connections.
+
+    Kagami's `-autoConnect YES` can fire the instant it launches, well before
+    `main()` below is done spending 12-27 s inside `ffmpeg` building the test clip.
+    A client that dials in during that window used to see "connection refused" (this
+    function used to bind+listen right where it now only accepts), which Kagami's own
+    reconnect/backoff correctly treated as a dropped connection and retried — a
+    fake-console.py startup-ordering artifact, not a Kagami defect, but one that added
+    confusing early `reconnects` to every soak's stats. Listening before the media is
+    built means a connection made during that window simply queues in the kernel's own
+    accept backlog until `serve` gets around to it, instead of being refused.
+    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", port))
     server.listen(1)
     print(f"listening on {port}")
+    return server
 
+
+def serve(server: socket.socket, worker, once: bool) -> None:
     while True:
         conn, address = server.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -220,6 +235,12 @@ def main() -> int:
     if (args.stall_ms is None) != (args.stall_every is None):
         parser.error("--stall-ms and --stall-every must be given together")
 
+    # Bound and listening before any ffmpeg work starts, so a client that dials in
+    # while the clip is still being built queues in the kernel instead of being
+    # refused — see `listening_socket`'s own header.
+    video_server = listening_socket(VIDEO_PORT)
+    audio_server = listening_socket(AUDIO_PORT)
+
     print("building test media with ffmpeg...")
     frames = split_access_units(build_test_video(args.seconds, args.gop, args.motion, args.bitrate))
     tone = build_test_audio(args.seconds)
@@ -263,8 +284,8 @@ def main() -> int:
             time.sleep(max(0, target - time.monotonic()))
 
     threads = [
-        threading.Thread(target=serve, args=(VIDEO_PORT, video_worker, args.once), daemon=True),
-        threading.Thread(target=serve, args=(AUDIO_PORT, audio_worker, args.once), daemon=True),
+        threading.Thread(target=serve, args=(video_server, video_worker, args.once), daemon=True),
+        threading.Thread(target=serve, args=(audio_server, audio_worker, args.once), daemon=True),
     ]
     for thread in threads:
         thread.start()
