@@ -1,4 +1,5 @@
 import CoreVideo
+import Foundation
 import Synchronization
 import XCTest
 
@@ -16,9 +17,11 @@ final class LatestFrameSlotTests: XCTestCase {
         let stats = PipelineStats()
         let slot = LatestFrameSlot(stats: stats)
         let buffer = makePixelBuffer()
+        let generation = UUID()
+        slot.beginGeneration(generation)
 
         for index in 0..<5 {
-            slot.write(.init(buffer: buffer, timestampMicros: UInt64(index)))
+            slot.write(.init(buffer: buffer, timestampMicros: UInt64(index)), generation: generation)
         }
         XCTAssertEqual(stats.snapshot().framesSuperseded, 4)
 
@@ -32,11 +35,13 @@ final class LatestFrameSlotTests: XCTestCase {
         let stats = PipelineStats()
         let slot = LatestFrameSlot(stats: stats)
         let buffer = makePixelBuffer()
+        let generation = UUID()
+        slot.beginGeneration(generation)
 
         var displayed = 0
         var rng = SystemRandomNumberGenerator()
         for index in 0..<10_000 {
-            slot.write(.init(buffer: buffer, timestampMicros: UInt64(index)))
+            slot.write(.init(buffer: buffer, timestampMicros: UInt64(index)), generation: generation)
             // A consumer that only sometimes keeps up, same as a real renderer racing
             // the decoder: whenever it does read, that frame counts as displayed.
             if Bool.random(using: &rng), slot.take() != nil {
@@ -52,12 +57,55 @@ final class LatestFrameSlotTests: XCTestCase {
     func testWriteWakesTheRegisteredReader() {
         let slot = LatestFrameSlot()
         let buffer = makePixelBuffer()
+        let generation = UUID()
+        slot.beginGeneration(generation)
         let woken = Mutex(0)
         slot.setDidWrite { woken.withLock { $0 += 1 } }
 
-        slot.write(.init(buffer: buffer, timestampMicros: 1))
-        slot.write(.init(buffer: buffer, timestampMicros: 2))
+        slot.write(.init(buffer: buffer, timestampMicros: 1), generation: generation)
+        slot.write(.init(buffer: buffer, timestampMicros: 2), generation: generation)
 
         XCTAssertEqual(woken.withLock { $0 }, 2)
+    }
+
+    /// Regression test for the cross-generation race: a connection's presentation loop
+    /// can still be decoding and writing after a new connection attempt has already
+    /// begun (cancellation is cooperative, not instant), and the slot is never recreated
+    /// per attempt. A write tagged with anything other than the current generation must
+    /// be dropped outright — not superseded, not counted, not woken for — exactly as if
+    /// it had never been sent.
+    func testWriteFromAStaleGenerationIsDroppedEntirely() {
+        let stats = PipelineStats()
+        let slot = LatestFrameSlot(stats: stats)
+        let buffer = makePixelBuffer()
+        let woken = Mutex(0)
+        slot.setDidWrite { woken.withLock { $0 += 1 } }
+
+        let dyingGeneration = UUID()
+        slot.beginGeneration(dyingGeneration)
+        slot.write(.init(buffer: buffer, timestampMicros: 1), generation: dyingGeneration)
+        XCTAssertEqual(woken.withLock { $0 }, 1)
+        XCTAssertEqual(slot.take()?.timestampMicros, 1)
+
+        // A new connection attempt begins -- the old one's presentation loop has not
+        // necessarily noticed its own cancellation yet, and keeps decoding.
+        let freshGeneration = UUID()
+        slot.beginGeneration(freshGeneration)
+
+        // The dying generation's loop produces one more frame and writes it, unaware
+        // anything has changed.
+        slot.write(.init(buffer: buffer, timestampMicros: 2), generation: dyingGeneration)
+
+        // Dropped outright: no wake, no supersede count, and the slot still holds
+        // whatever the fresh generation last legitimately wrote (nothing, here) rather
+        // than the stale frame.
+        XCTAssertEqual(woken.withLock { $0 }, 1)
+        XCTAssertEqual(stats.snapshot().framesSuperseded, 0)
+        XCTAssertNil(slot.take())
+
+        // The fresh generation's own writes are unaffected.
+        slot.write(.init(buffer: buffer, timestampMicros: 3), generation: freshGeneration)
+        XCTAssertEqual(woken.withLock { $0 }, 2)
+        XCTAssertEqual(slot.take()?.timestampMicros, 3)
     }
 }

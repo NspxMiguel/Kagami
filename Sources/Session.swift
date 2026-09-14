@@ -67,6 +67,10 @@ final class Session {
         generation = UUID()
         let token = generation
         let blankScreen = turnOffConsoleScreen
+        // Closes the cross-generation race at its source: from this line on, the slot
+        // drops any write not tagged with `token`, even one from a previous connection
+        // that has not noticed its own cancellation yet. See `LatestFrameSlot`'s header.
+        decoder.beginGeneration(token)
         decoder.reset()
         stats.reset()
         framesPerSecond = 0
@@ -89,6 +93,10 @@ final class Session {
     func disconnect() {
         // Invalidate callbacks before cancellation, so old connections cannot mutate a new one.
         generation = UUID()
+        // Nothing holds this generation, so the dying connection's presentation loop
+        // stops being able to write into the slot immediately, rather than only once
+        // (or if) a later `connect()` happens to begin a fresh one.
+        decoder.beginGeneration(generation)
         videoTask?.cancel()
         videoTask = nil
         audioTask?.cancel()
@@ -129,7 +137,9 @@ final class Session {
                 presentation = Task {
                     for await frame in ingest.frames {
                         guard !Task.isCancelled else { break }
-                        slot.write(LatestFrameSlot.Frame(buffer: frame.buffer, timestampMicros: frame.timestampMicros))
+                        slot.write(
+                            LatestFrameSlot.Frame(buffer: frame.buffer, timestampMicros: frame.timestampMicros),
+                            generation: token)
                     }
                 }
                 for try await packet in await stream.packets() {

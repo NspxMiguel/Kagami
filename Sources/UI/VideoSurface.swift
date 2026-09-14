@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import Foundation
 import Synchronization
 import SwiftUI
 import UIKit
@@ -10,6 +11,9 @@ import UIKit
 @MainActor
 final class DecodedVideo {
     weak var surface: VideoSurfaceView?
+    // A single slot for the whole session's lifetime, never recreated per connection
+    // attempt — which is exactly why every write into it has to be tagged with
+    // `beginGeneration`'s generation. See `LatestFrameSlot`'s own header.
     let slot = LatestFrameSlot()
     var stats: PipelineStats? {
         didSet { slot.stats = stats }
@@ -19,6 +23,13 @@ final class DecodedVideo {
     /// few times a second from here, never per frame, so going through the pump's own
     /// lock is fine.
     var displayedTimestampMicros: UInt64? { surface?.latestPresentedTimestampMicros }
+
+    /// Forwarded to the slot: called once per connection attempt (and once on
+    /// disconnect, with a generation nothing holds) so a connection that is still
+    /// tearing down can no longer write a stale frame into a session that has moved on.
+    func beginGeneration(_ generation: UUID) {
+        slot.beginGeneration(generation)
+    }
 
     func reset() {
         _ = slot.take()
