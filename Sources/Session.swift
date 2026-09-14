@@ -143,6 +143,22 @@ final class Session {
     ) async {
         var retry = 0
         var consecutiveWedgesWithNoProgress = 0
+        // Sticky across a whole streak of no-progress reconnects, cleared only by
+        // real decode progress — never by a single no-progress attempt on its own.
+        // `receivedDataThisAttempt` is measured per attempt, but a lone attempt that
+        // happens to see zero packets (a race during reconnect against a peer's own
+        // accept loop, a momentary Wi-Fi blip) must not erase the fact that an
+        // *earlier* attempt in this same streak already proved the console is
+        // reachable and the decoder produced nothing anyway. Without this,
+        // `consecutiveWedgesWithNoProgress` resets to zero on that one silent attempt
+        // exactly as if the whole streak had never happened. A soak with this exact
+        // scenario measured `framesDecoded` frozen for the entire run while
+        // `reconnects` still climbed to 21 with the give-up bound never tripping —
+        // impossible if every one of those reconnects had actually been counted
+        // (seven in a row exceeds `maxConsecutiveWedgesBeforeGivingUp`), so at least
+        // one attempt in that streak must have measured `receivedDataThisAttempt ==
+        // false` and reset the counter without this stickiness.
+        var sawDataSinceLastProgress = false
         while !Task.isCancelled {
             let stream = SysDVRStream(host: host, kind: .video, turnOffConsoleScreen: blankScreen)
             let ingest = VideoIngest(stats: stats)
@@ -233,8 +249,18 @@ final class Session {
             // this check's own narrower definition.
             let noProgressDespiteData = receivedDataThisAttempt && !madeProgress
             let waitMillis: Int
-            if wasWedged || noProgressDespiteData {
-                consecutiveWedgesWithNoProgress = madeProgress ? 0 : consecutiveWedgesWithNoProgress + 1
+            if madeProgress {
+                // Real decode progress, however this attempt eventually ended: the
+                // decoder is not the problem, so whatever no-progress streak might
+                // have been building — including whether it has ever seen data —
+                // resets clean.
+                consecutiveWedgesWithNoProgress = 0
+                sawDataSinceLastProgress = false
+                retry = min(retry + 1, Self.reconnectBackoffMillis.count)
+                waitMillis = Self.reconnectBackoffMillis[retry - 1]
+            } else if wasWedged || noProgressDespiteData {
+                consecutiveWedgesWithNoProgress += 1
+                sawDataSinceLastProgress = true
                 // A soak measured this exact failure surviving every reconnect this
                 // loop can throw at it — a brand-new TCP connection, a brand-new
                 // VideoIngest, a brand-new H264Decoder and VTDecompressionSession,
@@ -265,7 +291,17 @@ final class Session {
                     max(0, consecutiveWedgesWithNoProgress - 1), Self.decoderWedgeBackoffMillis.count - 1)
                 waitMillis = Self.decoderWedgeBackoffMillis[index]
             } else {
-                consecutiveWedgesWithNoProgress = 0
+                // Neither progress nor any evidence either way this time — most often
+                // an attempt that failed before a single packet arrived (console off,
+                // wrong address, Wi-Fi down, or a momentary race dialing back in).
+                // Only clear the wedge streak if nothing has proven the decoder is the
+                // problem yet: once an earlier attempt in this same streak *did*
+                // receive data and still decoded nothing, one data-less attempt in
+                // between must not erase that evidence, or it masks a decoder that
+                // really is wedged behind an unrelated, one-off connection hiccup.
+                if !sawDataSinceLastProgress {
+                    consecutiveWedgesWithNoProgress = 0
+                }
                 retry = min(retry + 1, Self.reconnectBackoffMillis.count)
                 waitMillis = Self.reconnectBackoffMillis[retry - 1]
             }
