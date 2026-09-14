@@ -56,6 +56,7 @@ final class PipelineStatsTests: XCTestCase {
         snapshot.rendererNotReady = 4
         snapshot.framesDisplayed = 890
         snapshot.reconnects = 0
+        snapshot.decoderResets = 1
         snapshot.audioSamplesTrimmed = 6
         snapshot.audioUnderruns = 1
         snapshot.receiveBacklogMillis = 37
@@ -86,6 +87,7 @@ final class PipelineStatsTests: XCTestCase {
                 "framesDisplayed": 890,
                 "framesDisplayedPerSecond": 30,
                 "reconnects": 0,
+                "decoderResets": 1,
                 "audioSamplesTrimmed": 6,
                 "audioUnderruns": 1,
                 "receiveBacklogMillis": 37,

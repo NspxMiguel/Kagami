@@ -35,6 +35,11 @@ actor SysDVRStream {
         /// because 3 s of backlog means something is wrong with the connection, not the
         /// decoder.
         case backlogExceeded
+        /// `VideoIngest`'s self-heal policy already tried a full decoder reset and
+        /// packets kept arriving with still no frame produced — the decoder itself is
+        /// exonerated at that point, and only tearing down this TCP connection and
+        /// renegotiating from scratch is left to try.
+        case decoderWedged
 
         var errorDescription: String? {
             switch self {
@@ -51,6 +56,9 @@ actor SysDVRStream {
                 return String(localized: "The console closed the connection.")
             case .backlogExceeded:
                 return String(localized: "The stream fell too far behind live to catch up.")
+            case .decoderWedged:
+                return String(
+                    localized: "The video decoder stopped producing frames and could not recover.")
             case .timedOut:
                 return String(
                     localized: "The console did not respond. Check its address and Wi-Fi.")

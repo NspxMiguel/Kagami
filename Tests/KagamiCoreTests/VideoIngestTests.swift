@@ -155,13 +155,13 @@ final class VideoIngestTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// KNOWN FAILING AT HEAD — reproduces the live-edge freeze from two independent
-    /// simulator soaks (`Tools/fake-console.py --gop 150 --motion noise --stall-ms 800
-    /// --stall-every 5`), which froze at exactly `framesDecoded == 16368` after roughly
-    /// 600 s of playback. This asserts the CORRECT behaviour (the pipeline recovers and
-    /// keeps decoding), not the current one, so it fails today and should turn green
-    /// the moment the fix lands. Runs in well under a minute — no simulator, no
-    /// `--stall-ms`, no real-time pacing.
+    /// Regression test for the live-edge freeze from two independent simulator soaks
+    /// (`Tools/fake-console.py --gop 150 --motion noise --stall-ms 800 --stall-every
+    /// 5`), which froze at exactly `framesDecoded == 16368` after roughly 600 s of
+    /// playback. Asserts the CORRECT behaviour — the pipeline recovers and keeps
+    /// decoding — which `enterKeyframeWait()` invalidating `session` (VideoDecoder.swift)
+    /// now guarantees. Runs in well under a minute — no simulator, no `--stall-ms`, no
+    /// real-time pacing.
     ///
     /// This is not a bitstream defect, and the checked-in fixture proves it: looping
     /// the existing 300-frame `busy-gop150.h264` (a completely different, much
@@ -207,24 +207,70 @@ final class VideoIngestTests: XCTestCase, @unchecked Sendable {
         await ingest.finish()
 
         let final = stats.snapshot()
-        // The correct behaviour: an IDR after a VideoToolbox malfunction rebuilds the
-        // session and decoding resumes, so framesDecoded should keep pace with what was
-        // fed, not freeze at whatever it reached right before the first failure.
-        //
-        // AT HEAD: VideoToolbox malfunctions once around access unit 16,381 and
-        // `H264Decoder` never rebuilds the session, so framesDecoded sticks at ~16,381
-        // for the remaining ~600 access units fed here — this assertion fails at HEAD.
+        // An IDR after a VideoToolbox malfunction rebuilds the session and decoding
+        // resumes, so framesDecoded should keep pace with what was fed, not freeze at
+        // whatever it reached right before the first failure.
         XCTAssertGreaterThan(
             final.framesDecoded, totalToFeed - 300,
             "framesDecoded should keep advancing after the session recovers, not freeze once "
                 + "VideoToolbox malfunctions (the live-edge freeze this test reproduces)")
-        // The correct behaviour: one malfunction costs one keyframe wait, not one per
-        // IDR forever. AT HEAD this is off by an order of magnitude (every one of the
-        // ~4 IDRs fed after the malfunction fails identically).
+        // One malfunction costs one keyframe wait, not one per IDR forever.
         XCTAssertLessThanOrEqual(
             final.decodeErrors, 1,
             "expected the decoder to recover after the next keyframe, not fail identically on "
                 + "every later IDR forever (the livelock)")
+    }
+
+    /// Regression test for `VideoIngest`'s self-heal policy: an unknown failure mode
+    /// — not the VideoToolbox session malfunction above, and not a single corrupted
+    /// picture either — that leaves the decoder waiting for a keyframe it will never
+    /// get from this input must still recover once real access units come back,
+    /// bounded by how long packets can keep arriving here without a single one
+    /// producing a frame before `VideoIngest` steps in and resets the decoder itself.
+    func testSelfHealResetsTheDecoderAfterAProlongedStallThenRecoversOnRealIDRs() async throws {
+        let units = try Self.loadBusyGOPAccessUnits()
+        let stats = PipelineStats()
+        let ingest = VideoIngest(stats: stats)
+        let receiver = Task { for await _ in ingest.frames {} }
+        defer { receiver.cancel() }
+
+        // No Annex-B start code anywhere in this — `AnnexB.parse` finds neither a
+        // parameter set nor a keyframe, so `H264Decoder` never even reaches
+        // VideoToolbox with it; it just sits waiting for a keyframe that will never
+        // arrive from this input. Exactly the "something this pipeline has no
+        // targeted fix for" case the self-heal net exists for.
+        let garbage = Data(repeating: 0x42, count: 4096)
+
+        let origin = ContinuousClock.now
+        // 75 packets, 33.3 ms apart in the same synthetic clock `dequeuedAt` already
+        // uses elsewhere in this file: 2.5 s of packets steadily arriving, comfortably
+        // past the 2 s reset threshold and well under the 6 s reconnect one.
+        for index in 0..<75 {
+            let at = origin.advanced(by: .microseconds(Int64(index) * Int64(Self.frameInterval)))
+            try await ingest.accept(Self.packet(garbage, sequence: index), dequeuedAt: at)
+        }
+
+        let stalled = stats.snapshot()
+        XCTAssertEqual(stalled.framesDecoded, 0, "garbage input should never decode")
+        XCTAssertGreaterThanOrEqual(
+            stalled.decoderResets, 1,
+            "a 2+ s stall with packets still arriving should have triggered a self-heal reset")
+        XCTAssertEqual(
+            stalled.reconnects, 0,
+            "2.5 s of stall is under the 6 s reconnect bound — a reset should have been enough")
+
+        // Real access units resume right where the garbage left off, on the same
+        // clock, starting with the fixture's own first frame (an IDR).
+        let resumeAt = origin.advanced(by: .microseconds(75 * Int64(Self.frameInterval)))
+        for index in 0..<units.count {
+            let at = resumeAt.advanced(by: .microseconds(Int64(index) * Int64(Self.frameInterval)))
+            try await ingest.accept(Self.packet(units[index], sequence: 75 + index), dequeuedAt: at)
+        }
+        await ingest.finish()
+
+        XCTAssertGreaterThan(
+            stats.snapshot().framesDecoded, 0,
+            "the decoder should recover and resume decoding once real access units return")
     }
 
     // MARK: - Fixture loading

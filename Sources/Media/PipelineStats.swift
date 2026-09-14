@@ -24,6 +24,13 @@ final class PipelineStats: Sendable {
         var rendererNotReady = 0
         var framesDisplayed = 0
         var reconnects = 0
+        /// How many times `VideoIngest`'s self-heal policy fully reset `H264Decoder`
+        /// (fresh VT session, cleared parameter sets) because packets kept arriving but
+        /// no frame was produced for ~2 s — the bounded fallback for a decode failure
+        /// this pipeline does not already have a targeted fix for, not the normal
+        /// per-access-unit keyframe wait (`keyframeWaitsEntered`) that a single bad
+        /// frame or a session malfunction already recovers from on the next IDR.
+        var decoderResets = 0
         var audioSamplesTrimmed = 0
         var audioUnderruns = 0
         /// Latest console timestamp seen minus the timestamp currently being decoded, in
@@ -97,6 +104,7 @@ extension PipelineStats.Snapshot {
             ("framesDisplayed", framesDisplayed),
             ("framesDisplayedPerSecond", framesDisplayedPerSecond),
             ("reconnects", reconnects),
+            ("decoderResets", decoderResets),
             ("audioSamplesTrimmed", audioSamplesTrimmed),
             ("audioUnderruns", audioUnderruns),
             ("receiveBacklogMillis", receiveBacklogMillis),

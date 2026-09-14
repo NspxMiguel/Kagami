@@ -21,9 +21,35 @@ actor VideoIngest {
     /// suppressing output brings the picture back to something worth waiting for.
     private static let hardBacklogCeiling = Duration.seconds(3)
 
+    /// A self-heal net under whatever decode failure this pipeline does not already
+    /// have a targeted fix for: `H264Decoder` recovers a single bad access unit or a
+    /// VideoToolbox session malfunction on its own at the next keyframe (see
+    /// `enterKeyframeWait`), but nothing guarantees every future failure mode looks
+    /// like one of those. If packets keep arriving here but none of them has produced
+    /// a frame in this long, the decoder is presumed wedged in some way it cannot see
+    /// past on its own, and gets a full reset — cleared parameter sets and VT session —
+    /// so the very next keyframe rebuilds from scratch rather than resubmitting into
+    /// whatever bad state caused this.
+    private static let selfHealResetAfter = Duration.seconds(2)
+    /// If a reset alone does not bring frames back this much longer — roughly two more
+    /// incoming keyframes at SysDVR's usual GOP, hence "or ~6 s" — the decoder itself is
+    /// exonerated: only tearing down the TCP connection and renegotiating from scratch
+    /// is left to try.
+    private static let selfHealReconnectAfter = Duration.seconds(6)
+
     private let decoder: H264Decoder
     private let stats: PipelineStats
     private var timeline = StreamTimeline()
+    /// The moment the most recent frame actually reached `frames`, or this actor's own
+    /// creation time if none has yet — the clock the self-heal policy above measures
+    /// against. Deliberately keyed off `dequeuedAt`, the same synthetic-clock-friendly
+    /// timestamp `excessDelay` already uses, so a test can drive this without a real
+    /// sleep exactly the way `testConsumerFallingBehindIsDetectedEvenWithNoNetworkLateness`
+    /// already does for the backlog ceiling.
+    private var lastFrameProducedAt = ContinuousClock.now
+    /// Sticky within one stall so a reset costs exactly one, not one per packet still
+    /// arriving before the next keyframe. Cleared the moment a frame is produced again.
+    private var resetSinceLastFrame = false
     /// Owns the ambient-colour reduction described in `AmbientSampler`'s own header.
     /// Fed every successfully decoded picture; the sampler decides for itself, by the
     /// console's own clock, whether 250 ms have passed and whether the colour actually
@@ -66,8 +92,14 @@ actor VideoIngest {
             // produces a picture for those), so this already only ever sees "the
             // newest decoded buffer" the plan calls for — no separate freshness check
             // needed here.
-            if let frame, let colour = await ambient.sample(frame) {
-                stats.setAmbientColor(colour)
+            if let frame {
+                lastFrameProducedAt = dequeuedAt
+                resetSinceLastFrame = false
+                if let colour = await ambient.sample(frame) {
+                    stats.setAmbientColor(colour)
+                }
+            } else {
+                try await selfHealIfWedged(now: dequeuedAt)
             }
         } catch {
             // A decode error is not a dead connection. `H264Decoder` has already
@@ -82,13 +114,36 @@ actor VideoIngest {
             // pays a full handshake plus keyframe wait for a single bad access unit
             // the decoder was already recovering from without any help from us.
             stats.increment(\.decodeErrors)
+            try await selfHealIfWedged(now: dequeuedAt)
         }
+    }
+
+    /// The self-heal policy described on this actor's own properties above: escalates
+    /// from "reset the decoder" to "reconnect the stream" only as long as packets keep
+    /// arriving here without a single one producing a frame. A packet that does
+    /// produce a frame (handled in `accept`, above) clears `lastFrameProducedAt` and
+    /// `resetSinceLastFrame` before this is ever consulted again, so a stall that
+    /// resolves on its own — the ordinary keyframe wait `H264Decoder` already recovers
+    /// from — never reaches here for long enough to do anything.
+    private func selfHealIfWedged(now: ContinuousClock.Instant) async throws {
+        let stalledFor = lastFrameProducedAt.duration(to: now)
+        guard stalledFor >= Self.selfHealResetAfter else { return }
+        guard resetSinceLastFrame else {
+            stats.increment(\.decoderResets)
+            await decoder.reset()
+            resetSinceLastFrame = true
+            return
+        }
+        guard stalledFor >= Self.selfHealReconnectAfter else { return }
+        throw SysDVRStream.Failure.decoderWedged
     }
 
     func reset() async {
         await decoder.reset()
         await ambient.reset()
         timeline = StreamTimeline()
+        lastFrameProducedAt = .now
+        resetSinceLastFrame = false
     }
 
     func finish() async {
