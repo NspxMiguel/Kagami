@@ -273,6 +273,86 @@ final class VideoIngestTests: XCTestCase, @unchecked Sendable {
             "the decoder should recover and resume decoding once real access units return")
     }
 
+    /// A second self-heal regression, distinct from the garbage-input one above: here
+    /// every packet IS a well-formed keyframe as far as Annex-B parsing and the SPS/PPS
+    /// are concerned — `H264Decoder` rebuilds a session and reaches VideoToolbox every
+    /// single time — but the picture payload itself is corrupted, so
+    /// `VTDecompressionSessionDecodeFrame` rejects it identically on every attempt. This
+    /// is what an unrecoverable-by-itself run of "undecodable IDRs" looks like: unlike
+    /// the P-frame corruption in `testCorruptedPictureWaitsForExactlyOneKeyframeThenResumes`
+    /// (one bad frame, healthy ones on either side), nothing here ever lets
+    /// `H264Decoder`'s own per-access-unit recovery succeed, because the very next
+    /// keyframe is exactly as corrupted as the last one. Only `VideoIngest`'s self-heal
+    /// noticing that packets keep arriving with no frame ever produced — first a reset,
+    /// then, if that alone does not help, a reconnect — bounds this.
+    func testSelfHealRecoversAfterRepeatedlyUndecodableKeyframesOnceValidOnesReturn() async throws {
+        let units = try Self.loadBusyGOPAccessUnits()
+
+        // `units[0]` is the fixture's first IDR: valid SPS/PPS followed by the slice
+        // itself. Corrupting the last third of it leaves the parameter sets untouched
+        // (so `H264Decoder` rebuilds a session successfully every time) while mangling
+        // enough of the slice that VideoToolbox has no reasonable concealment to fall
+        // back on and rejects the submission outright, every single time.
+        var corruptedBytes = [UInt8](units[0])
+        let corruptStart = corruptedBytes.count - max(1, corruptedBytes.count / 3)
+        for index in corruptStart..<corruptedBytes.count { corruptedBytes[index] ^= 0xFF }
+        let undecodableKeyframe = Data(corruptedBytes)
+
+        let stats = PipelineStats()
+        let ingest = VideoIngest(stats: stats)
+        let receiver = Task { for await _ in ingest.frames {} }
+        defer { receiver.cancel() }
+
+        let origin = ContinuousClock.now
+        // 200 packets, 33.3 ms apart on the console clock and the synthetic
+        // `dequeuedAt` clock together — matching `Self.packet`'s own timestamp cadence
+        // is deliberate here, not incidental: `dequeuedAt` racing ahead of the
+        // packet's own header timestamp is exactly `StreamTimeline.excessDelay`'s
+        // definition of falling behind, and would throw `.backlogExceeded` long before
+        // this ever reached the self-heal path under test. 6.67 s of matched elapsed
+        // time comfortably clears both the 2 s reset threshold and the 6 s reconnect
+        // one, so this exercises the full escalation, not just the reset.
+        var wedged = false
+        for index in 0..<200 {
+            let at = origin.advanced(by: .microseconds(Int64(index) * Int64(Self.frameInterval)))
+            do {
+                try await ingest.accept(Self.packet(undecodableKeyframe, sequence: index), dequeuedAt: at)
+            } catch SysDVRStream.Failure.decoderWedged {
+                wedged = true
+                break
+            }
+        }
+
+        XCTAssertTrue(
+            wedged,
+            "repeated undecodable keyframes over 6.67 s of arrival should have exhausted the reset-"
+                + "then-reconnect self-heal policy, the same way `Session.runVideo` relies on to know "
+                + "when to give up on this connection and try a fresh one")
+        let afterWedge = stats.snapshot()
+        XCTAssertEqual(afterWedge.framesDecoded, 0, "a corrupted keyframe should never decode")
+        XCTAssertGreaterThanOrEqual(
+            afterWedge.decoderResets, 1,
+            "the self-heal policy should have reset the decoder before giving up on the connection")
+
+        // Mirrors `Session.runVideo`: a `.decoderWedged` throw is a signal to reconnect,
+        // which in production means a brand-new `VideoIngest`/`H264Decoder` for the next
+        // attempt — sharing the same `stats` the way `Session` shares one `PipelineStats`
+        // across every reconnect of a single session.
+        let freshIngest = VideoIngest(stats: stats)
+        let freshReceiver = Task { for await _ in freshIngest.frames {} }
+        defer { freshReceiver.cancel() }
+        let resumeAt = origin.advanced(by: .microseconds(200 * Int64(Self.frameInterval)))
+        for index in 0..<units.count {
+            let at = resumeAt.advanced(by: .microseconds(Int64(index) * Int64(Self.frameInterval)))
+            try await freshIngest.accept(Self.packet(units[index], sequence: 1000 + index), dequeuedAt: at)
+        }
+        await freshIngest.finish()
+
+        XCTAssertGreaterThan(
+            stats.snapshot().framesDecoded, 0,
+            "a fresh connection fed real access units should recover and start decoding again")
+    }
+
     // MARK: - Fixture loading
 
     private static func loadBusyGOPAccessUnits() throws -> [Data] {
