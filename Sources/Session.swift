@@ -128,6 +128,14 @@ final class Session {
     /// resets the schedule, the same way an ordinary healthy packet resets `retry`.
     private nonisolated static let decoderWedgeBackoffMillis = [1_000, 3_000, 8_000, 15_000]
 
+    /// How many wedge-driven reconnects in a row are allowed to produce not a single
+    /// frame before this loop stops trying and fails visibly instead. Comfortably past
+    /// the length of `decoderWedgeBackoffMillis` itself, so a genuinely recoverable
+    /// stall gets the full escalating schedule — and then it repeating at the longest
+    /// step a couple more times — before this gives up; see the call site's own header
+    /// for why giving up at all, rather than retrying forever, is the right call here.
+    private nonisolated static let maxConsecutiveWedgesBeforeGivingUp = 6
+
     nonisolated private func runVideo(
         host: String, blankScreen: Bool, token: UUID, slot: LatestFrameSlot
     ) async {
@@ -204,6 +212,28 @@ final class Session {
             let waitMillis: Int
             if wasWedged {
                 consecutiveWedgesWithNoProgress = madeProgress ? 0 : consecutiveWedgesWithNoProgress + 1
+                // A soak measured this exact failure surviving every reconnect this
+                // loop can throw at it — a brand-new TCP connection, a brand-new
+                // VideoIngest, a brand-new H264Decoder and VTDecompressionSession,
+                // repeated 28 times over 900s, every one wedging again on its very
+                // first keyframe. That pattern — zero progress across a full run of
+                // this schedule — is this loop's own signal that whatever broke is
+                // not scoped to anything it owns and is not coming back on its own:
+                // continuing to retry forever would just spin the console's Wi-Fi and
+                // this device's battery for a picture that providably never returns.
+                // Failing here, instead, tells the person watching a frozen screen
+                // that quitting and reopening Kagami — a fresh process, starting over
+                // with whatever this held onto released — is the one thing left that
+                // might actually help, rather than leaving them staring at a picture
+                // that looks like it is still trying.
+                guard consecutiveWedgesWithNoProgress <= Self.maxConsecutiveWedgesBeforeGivingUp else {
+                    await fail(
+                        String(
+                            localized:
+                                "The video pipeline stopped responding and could not recover after several attempts. Close and reopen Kagami to try again."
+                        ), token: token)
+                    return
+                }
                 // A wedge-driven reconnect starts the ordinary network backoff over
                 // too: whatever comes after this is a fresh problem, not a
                 // continuation of a socket that was already flaky.
