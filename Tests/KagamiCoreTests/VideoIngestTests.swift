@@ -155,6 +155,78 @@ final class VideoIngestTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// KNOWN FAILING AT HEAD — reproduces the live-edge freeze from two independent
+    /// simulator soaks (`Tools/fake-console.py --gop 150 --motion noise --stall-ms 800
+    /// --stall-every 5`), which froze at exactly `framesDecoded == 16368` after roughly
+    /// 600 s of playback. This asserts the CORRECT behaviour (the pipeline recovers and
+    /// keeps decoding), not the current one, so it fails today and should turn green
+    /// the moment the fix lands. Runs in well under a minute — no simulator, no
+    /// `--stall-ms`, no real-time pacing.
+    ///
+    /// This is not a bitstream defect, and the checked-in fixture proves it: looping
+    /// the existing 300-frame `busy-gop150.h264` (a completely different, much
+    /// lower-entropy stream than the soak's noisy one) hits the *exact same* failure at
+    /// the *exact same* access-unit count, 16381 — a number suspiciously close to
+    /// 2^14 = 16384. The boundary moved by only 13 access units between two unrelated
+    /// bitstreams, does not scale with content, and does not reproduce at all when a
+    /// fresh decoder is fed only the ~250 access units surrounding that same boundary
+    /// (verified separately, off this test, with zero errors). All of that points at an
+    /// internal VideoToolbox limit on how many access units one `VTDecompressionSession`
+    /// can decode before `VTDecompressionSessionDecodeFrame` starts synchronously
+    /// rejecting every submission with `kVTVideoDecoderMalfunctionErr` (-12909; verified
+    /// separately, off this test, that the rejection is synchronous, not the 200 ms
+    /// timeout path) — not at anything wrong with a particular frame's bytes.
+    ///
+    /// VideoToolbox malfunctioning is not itself the bug under test — a real console
+    /// session could trip the same wall from something else entirely (thermal
+    /// throttling, a hiccupping hardware decoder, memory pressure), and a long enough
+    /// real play session hits this exact ceiling too: 16,381 frames at 30 fps is about
+    /// nine minutes. The bug is that `H264Decoder` has no recovery from it:
+    /// `enterKeyframeWait()` (VideoDecoder.swift) never invalidates `session`, so
+    /// `decode()`'s rebuild guard — `parametersChanged || (session == nil &&
+    /// parsed.isKeyframe)` — never re-fires once the parameter sets stop changing (true
+    /// for this whole stream after the very first IDR), and every later keyframe keeps
+    /// resubmitting to the same wedged session, which rejects it identically, forever.
+    func testRecoversAfterVideoToolboxSessionMalfunctionInsteadOfFreezingForever() async throws {
+        let units = try Self.loadBusyGOPAccessUnits()
+        let stats = PipelineStats()
+        let ingest = VideoIngest(stats: stats)
+        let receiver = Task { for await _ in ingest.frames {} }
+        defer { receiver.cancel() }
+
+        // Comfortably past three IDRs (every 150 frames) beyond the ~16,381st access
+        // unit where VideoToolbox first malfunctions on this machine, so a real
+        // recovery — not just surviving the first failure — has room to show up.
+        let totalToFeed = 17_000
+        let origin = ContinuousClock.now
+        for index in 0..<totalToFeed {
+            let unit = units[index % units.count]
+            let at = origin.advanced(by: .microseconds(Int64(index) * Int64(Self.frameInterval)))
+            try await ingest.accept(Self.packet(unit, sequence: index), dequeuedAt: at)
+        }
+        await ingest.finish()
+
+        let final = stats.snapshot()
+        // The correct behaviour: an IDR after a VideoToolbox malfunction rebuilds the
+        // session and decoding resumes, so framesDecoded should keep pace with what was
+        // fed, not freeze at whatever it reached right before the first failure.
+        //
+        // AT HEAD: VideoToolbox malfunctions once around access unit 16,381 and
+        // `H264Decoder` never rebuilds the session, so framesDecoded sticks at ~16,381
+        // for the remaining ~600 access units fed here — this assertion fails at HEAD.
+        XCTAssertGreaterThan(
+            final.framesDecoded, totalToFeed - 300,
+            "framesDecoded should keep advancing after the session recovers, not freeze once "
+                + "VideoToolbox malfunctions (the live-edge freeze this test reproduces)")
+        // The correct behaviour: one malfunction costs one keyframe wait, not one per
+        // IDR forever. AT HEAD this is off by an order of magnitude (every one of the
+        // ~4 IDRs fed after the malfunction fails identically).
+        XCTAssertLessThanOrEqual(
+            final.decodeErrors, 1,
+            "expected the decoder to recover after the next keyframe, not fail identically on "
+                + "every later IDR forever (the livelock)")
+    }
+
     // MARK: - Fixture loading
 
     private static func loadBusyGOPAccessUnits() throws -> [Data] {
