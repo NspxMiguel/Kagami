@@ -160,6 +160,16 @@ final class VideoPump: @unchecked Sendable {
     /// against an empty slot until the next frame arrives.
     private func pump() {
         while renderer.isReadyForMoreMediaData {
+            // Per Apple's documented contract for `AVQueuedSampleBufferRendering`, once
+            // a renderer's `status` reports `.failed` it stays that way — continuing to
+            // enqueue, or polling `isReadyForMoreMediaData`, never recovers it on its
+            // own — until an explicit flush. Checking here, before every enqueue, is
+            // what lets the picture come back by itself instead of freezing on the last
+            // displayed frame until a manual Disconnect/Connect rebuilds the whole
+            // display layer.
+            if renderer.status == .failed {
+                renderer.flush(removingDisplayedImage: false)
+            }
             guard let frame = slot.take() else {
                 renderer.stopRequestingMediaData()
                 requesting.withLock { $0 = false }
