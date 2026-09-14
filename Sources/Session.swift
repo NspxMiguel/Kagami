@@ -116,19 +116,21 @@ final class Session {
     /// a truly gone console does not make the UI wait much longer than that per attempt.
     private nonisolated static let reconnectBackoffMillis = [300, 1000, 2000]
 
-    /// Backoff specifically for a reconnect triggered by `VideoIngest`'s self-heal
-    /// giving up on the decoder entirely (`SysDVRStream.Failure.decoderWedged`), as
-    /// opposed to an ordinary dropped connection. Deliberately much longer than
-    /// `reconnectBackoffMillis`: the socket itself is not the problem here (the
+    /// Backoff for a reconnect that looks decoder-side rather than network-side: either
+    /// `VideoIngest`'s own self-heal gave up on the decoder entirely
+    /// (`SysDVRStream.Failure.decoderWedged`), or this attempt received real packets
+    /// from the console but never decoded a single frame before failing some other
+    /// way (see `noProgressDespiteData` at the call site). Deliberately much longer
+    /// than `reconnectBackoffMillis`: the socket itself is not the problem here (the
     /// console answered fine), what is suspected to need time is whatever hardware or
     /// software video-decode resource left `H264Decoder` unable to produce a single
     /// frame no matter how many times it rebuilds its session. Grows only across
-    /// consecutive wedge-driven reconnects that themselves decode nothing before
-    /// wedging again — one that does produce even a single frame is real progress and
-    /// resets the schedule, the same way an ordinary healthy packet resets `retry`.
+    /// consecutive such reconnects that themselves decode nothing before failing
+    /// again — one that does produce even a single frame is real progress and resets
+    /// the schedule, the same way an ordinary healthy packet resets `retry`.
     private nonisolated static let decoderWedgeBackoffMillis = [1_000, 3_000, 8_000, 15_000]
 
-    /// How many wedge-driven reconnects in a row are allowed to produce not a single
+    /// How many decoder-side reconnects in a row are allowed to produce not a single
     /// frame before this loop stops trying and fails visibly instead. Comfortably past
     /// the length of `decoderWedgeBackoffMillis` itself, so a genuinely recoverable
     /// stall gets the full escalating schedule — and then it repeating at the longest
@@ -147,7 +149,7 @@ final class Session {
             var presentation: Task<Void, Never>?
             var terminalError: String?
             var wasWedged = false
-            let framesDecodedBeforeAttempt = stats.snapshot().framesDecoded
+            let beforeAttempt = stats.snapshot()
             do {
                 try await stream.connect()
                 try Task.checkCancellation()
@@ -208,9 +210,30 @@ final class Session {
             // one.
             await setState(.reconnecting, token: token)
             stats.increment(\.reconnects)
-            let madeProgress = stats.snapshot().framesDecoded > framesDecodedBeforeAttempt
+            let afterAttempt = stats.snapshot()
+            let madeProgress = afterAttempt.framesDecoded > beforeAttempt.framesDecoded
+            // Whether this attempt actually heard from the console at all — as opposed
+            // to a connection that failed before a single packet arrived (console off,
+            // wrong address, Wi-Fi down). Only an attempt that received real data yet
+            // still decoded nothing is evidence of a decoder-side problem; a silent
+            // attempt is an ordinary network failure and must not count toward giving
+            // up, no matter how many of those happen in a row.
+            let receivedDataThisAttempt = afterAttempt.packetsReceived > beforeAttempt.packetsReceived
+            // `VideoIngest`'s own `.decoderWedged` is the clean, expected way this
+            // shows up — but it is not the only one: a decoder that keeps failing every
+            // submission can also stall this same loop's *packet reading* for long
+            // enough (rebuilding a session, waiting out a hiccup) that `VideoIngest`
+            // itself throws `.backlogExceeded` first, over a live connection that was
+            // never actually the problem. Both are the same underlying fact — packets
+            // kept arriving and nothing got decoded — so both must count toward the
+            // same give-up counter. Counting only `.decoderWedged` let a run that kept
+            // tripping the backlog ceiling instead reconnect 19+ times with this
+            // counter reset to zero every single time, exactly the failure a soak
+            // caught: the pipeline never gave up because it never looked wedged by
+            // this check's own narrower definition.
+            let noProgressDespiteData = receivedDataThisAttempt && !madeProgress
             let waitMillis: Int
-            if wasWedged {
+            if wasWedged || noProgressDespiteData {
                 consecutiveWedgesWithNoProgress = madeProgress ? 0 : consecutiveWedgesWithNoProgress + 1
                 // A soak measured this exact failure surviving every reconnect this
                 // loop can throw at it — a brand-new TCP connection, a brand-new
