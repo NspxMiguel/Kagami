@@ -47,6 +47,14 @@ actor H264Decoder {
     /// this decoder itself already declared suspect.
     private let epoch = Mutex<UInt64>(0)
 
+    /// How many session rebuilds in a row have gone straight back into a keyframe
+    /// wait with no successful decode in between — i.e. how many times a *freshly
+    /// rebuilt* session has itself immediately turned out to be no better than the
+    /// one it replaced. Reset to zero the moment any access unit actually decodes.
+    /// `rebuildSession()` reads this to grow the delay before creating each
+    /// replacement session; see its own header for why that delay exists at all.
+    private var consecutiveMalfunctions = 0
+
     init(stats: PipelineStats? = nil) {
         self.stats = stats
         let channel = AsyncStream<DecodedFrame>.makeStream(bufferingPolicy: .bufferingNewest(1))
@@ -59,8 +67,8 @@ actor H264Decoder {
         continuation.finish()
     }
 
-    func reset() {
-        if let session { VTDecompressionSessionInvalidate(session) }
+    func reset() async {
+        if let session { invalidate(session) }
         session = nil
         format = nil
         parameterSets = []
@@ -69,8 +77,8 @@ actor H264Decoder {
         epoch.withLock { $0 &+= 1 }
     }
 
-    func finish() {
-        reset()
+    func finish() async {
+        await reset()
         continuation.finish()
     }
 
@@ -78,8 +86,8 @@ actor H264Decoder {
     /// any more — a network stall is handled by suppressing output, not by breaking the
     /// reference chain — but it stays as the honest response to a caller who knows for a
     /// fact that decoded state upstream was lost.
-    func recoverAfterDrop() {
-        enterKeyframeWait()
+    func recoverAfterDrop() async {
+        await enterKeyframeWait()
     }
 
     /// Feeds one access unit straight off the wire. When `suppressOutput` is set, the
@@ -123,7 +131,7 @@ actor H264Decoder {
         // stuck silently forever. `parsed.isKeyframe` keeps the retry off the far more
         // frequent P-frames, where there is nothing new to rebuild from anyway.
         if parameterSets.count >= 2, parametersChanged || (session == nil && parsed.isKeyframe) {
-            try rebuildSession()
+            try await rebuildSession()
         }
 
         if parsed.isKeyframe { endKeyframeWaitIfNeeded() }
@@ -175,7 +183,7 @@ actor H264Decoder {
                 sample, session: session, timestampMicros: timestampMicros,
                 suppressOutput: suppressOutput)
         } catch {
-            enterKeyframeWait()
+            await enterKeyframeWait()
             throw error
         }
     }
@@ -233,12 +241,17 @@ actor H264Decoder {
         }
         switch outcome {
         case .success:
+            // A real decode went through: whatever run of consecutive rebuild
+            // failures might have been building up is over, and the next one (if
+            // there ever is one) starts its backoff from scratch, not from where a
+            // now-resolved streak left off.
+            consecutiveMalfunctions = 0
             return frame
         case .rejectedSynchronously(let status):
-            enterKeyframeWait()
+            await enterKeyframeWait()
             throw DecodeFailure(status: status)
         case .timedOut:
-            enterKeyframeWait()
+            await enterKeyframeWait()
             throw DecodeFailure(status: kVTVideoDecoderMalfunctionErr)
         }
     }
@@ -339,10 +352,17 @@ actor H264Decoder {
         }
     }
 
-    private func enterKeyframeWait() {
+    private func enterKeyframeWait() async {
         guard !waitingForKeyframe else { return }
         waitingForKeyframe = true
         keyframeWaitStartedAt = .now
+        // Counts this exact malfunction, not this exact rebuild attempt: bumped here,
+        // unconditionally, on every fresh break in the reference chain, and only ever
+        // cleared by an actual successful decode (`submit`'s `.success` case) — never
+        // by `rebuildSession` itself, since a rebuild that turns out to be no better
+        // is precisely the case this exists to slow down. See `rebuildSession`'s own
+        // header for what it does with this count.
+        consecutiveMalfunctions += 1
         stats?.increment(\.keyframeWaitsEntered)
         epoch.withLock { $0 &+= 1 }
         // A decode failure means this exact session may be the problem, not only the
@@ -359,7 +379,7 @@ actor H264Decoder {
         // already-wedged session, which rejected it identically — forever, once per
         // incoming keyframe.
         if let session {
-            VTDecompressionSessionInvalidate(session)
+            invalidate(session)
             self.session = nil
         }
         format = nil
@@ -374,8 +394,61 @@ actor H264Decoder {
         keyframeWaitStartedAt = nil
     }
 
-    private func rebuildSession() throws {
-        if let session { VTDecompressionSessionInvalidate(session) }
+    /// Gives any asynchronous decode still outstanding on `session` a chance to
+    /// retire before the session is thrown away. Per Apple's documented contract for
+    /// `VTDecompressionSessionInvalidate`, invalidating a session while a
+    /// decompression is still outstanding — the one real possibility in this decoder
+    /// being `attemptDecode`'s 200 ms timeout path, where this actor deliberately
+    /// moves on without ever learning whether VideoToolbox's callback is still going
+    /// to fire — risks leaking whatever hardware or software decode resource that
+    /// submission was holding rather than returning it to the pool a later session
+    /// could use.
+    ///
+    /// Deliberately fire-and-forget rather than awaited: `VTDecompressionSessionWait-
+    /// ForAsynchronousFrames` is a genuinely blocking call with no documented upper
+    /// bound, and a session that is truly wedged may never retire anything. Blocking
+    /// this actor on it would risk trading one hang (a permanently frozen decoder)
+    /// for a worse one (a permanently frozen actor); running it detached means the
+    /// worst case is a single background thread parked for a while, not this
+    /// decoder's own ability to move on to rebuilding a replacement session.
+    /// `session` is not `Sendable`, so it crosses into the detached work as a bare
+    /// pointer — `passRetained`/`takeRetainedValue` add and then consume one extra
+    /// retain specifically so the object stays alive for the background call even
+    /// though the caller (`enterKeyframeWait`/`reset`) clears its own `self.session`
+    /// to `nil` immediately after this returns.
+    private nonisolated func invalidate(_ session: VTDecompressionSession) {
+        // `Unmanaged` itself carries no Sendable conformance (it says nothing about
+        // whether crossing an isolation boundary with it is actually safe), so it is
+        // wrapped the same way `DecodedFrame` wraps `CVPixelBuffer` just below: the
+        // discipline living at this one use site — a single extra retain consumed by
+        // exactly one background closure — is what makes it safe here, not the type.
+        let retained = UnsafeTransfer(value: Unmanaged.passRetained(session))
+        DispatchQueue.global(qos: .userInitiated).async {
+            let session = retained.value.takeRetainedValue()
+            _ = VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+        }
+    }
+
+    /// How long to wait before actually creating a replacement session, based on how
+    /// many rebuilds in a row have gone straight back into a keyframe wait with no
+    /// successful decode in between. A single bad access unit or a one-off
+    /// VideoToolbox hiccup — the overwhelmingly common case — still rebuilds and
+    /// recovers on the very next keyframe with no perceptible delay: nothing about
+    /// today's behaviour changes for it. Only a rebuild that is ITSELF still failing,
+    /// back to back, grows the wait — the one signal available from inside this
+    /// decoder that recreating the session object is not, by itself, fixing whatever
+    /// is actually wrong, and that whatever shared resource is involved may need real
+    /// wall-clock time rather than another instant retry.
+    private func sessionRebuildDelay() -> Duration {
+        guard consecutiveMalfunctions > 1 else { return .zero }
+        let stepsMillis = [250, 500, 1_000, 2_000, 4_000]
+        let index = min(consecutiveMalfunctions - 2, stepsMillis.count - 1)
+        return .milliseconds(stepsMillis[index])
+    }
+
+    private func rebuildSession() async throws {
+        if let session { invalidate(session) }
         session = nil
         format = nil
         // Whatever reference frames the old session held are gone the moment it is
@@ -383,7 +456,15 @@ actor H264Decoder {
         // rebuild that fails to even produce a session still leaves the decoder in the
         // same recovered state a successful rebuild would, instead of leaving
         // `waitingForKeyframe` stale while `session` is nil.
-        enterKeyframeWait()
+        await enterKeyframeWait()
+
+        let delay = sessionRebuildDelay()
+        if delay > .zero {
+            log.notice(
+                "delaying session rebuild \(milliseconds(delay))ms after \(self.consecutiveMalfunctions) consecutive malfunctions"
+            )
+            try? await Task.sleep(for: delay)
+        }
 
         // The parameter sets must stay alive and contiguous for the duration of the
         // call, and CoreMedia wants non-optional pointers — hence the manual allocation
@@ -436,6 +517,14 @@ actor H264Decoder {
                 created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         }
     }
+}
+
+/// A one-off vehicle for handing a single non-`Sendable` value to exactly one
+/// background closure — used by `H264Decoder.invalidate` to carry an `Unmanaged`
+/// session reference across to `DispatchQueue.global()`. `@unchecked` is the
+/// discipline described at each use site, never a blanket claim about `Wrapped`.
+struct UnsafeTransfer<Wrapped>: @unchecked Sendable {
+    let value: Wrapped
 }
 
 /// Carries a `CVPixelBuffer` off the actor. `@unchecked` is the discipline described at
