@@ -112,6 +112,35 @@ final class VideoPump: @unchecked Sendable {
     private var format: CMVideoFormatDescription?
     private let requesting = Mutex(false)
     private let lastPresentedTimestamp = Mutex<UInt64?>(nil)
+    /// Frames enqueued since the last periodic flush; only ever touched on `queue`,
+    /// same as `format`. See `flushPeriodicallyIfDue`'s own header for why this exists
+    /// at all.
+    private var framesSincePeriodicFlush = 0
+    /// A soak against a real live-edge stream measured video permanently freezing —
+    /// `VTDecompressionSessionDecodeFrame` itself synchronously rejecting every future
+    /// submission — at a strikingly consistent access-unit count (~16,368) regardless
+    /// of how many times the decode side (`H264Decoder`/`VideoIngest`) was torn down
+    /// and rebuilt from scratch across a full reconnect. That rules the decode side
+    /// out: whatever hits a hard ceiling near there survives a brand-new
+    /// `VTDecompressionSession`, which a per-video-stream reconnect always gets, so it
+    /// cannot be scoped to that session. This renderer, by contrast, is NOT recreated
+    /// by a video-only reconnect — `DecodedVideo`/`VideoSurfaceView` live for the
+    /// whole `Session`, torn down only by a full user-initiated `disconnect()` — and
+    /// is the one plausible holder of a long-lived claim on the same Metal-compatible,
+    /// IOSurface-backed buffer pool the decoder's own output buffers are allocated
+    /// from. A periodic, otherwise-harmless flush (`removingDisplayedImage: false`
+    /// keeps whatever is on screen right now) is the cheapest way to test — and, if
+    /// this actually is the culprit, mitigate — that without waiting on a fix for
+    /// whichever side turns out to be the real one.
+    private static let periodicFlushEveryFrames = 1_500
+
+    /// Wraps `flush(removingDisplayedImage:)` and resets the counter above.
+    private func flushPeriodicallyIfDue() {
+        framesSincePeriodicFlush += 1
+        guard framesSincePeriodicFlush >= Self.periodicFlushEveryFrames else { return }
+        framesSincePeriodicFlush = 0
+        renderer.flush(removingDisplayedImage: false)
+    }
 
     init(renderer: AVSampleBufferVideoRenderer, slot: LatestFrameSlot) {
         self.renderer = renderer
@@ -199,5 +228,6 @@ final class VideoPump: @unchecked Sendable {
             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         renderer.enqueue(sample)
         lastPresentedTimestamp.withLock { $0 = frame.timestampMicros }
+        flushPeriodicallyIfDue()
     }
 }
