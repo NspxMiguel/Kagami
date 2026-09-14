@@ -145,8 +145,15 @@ final class PCMRingBuffer: @unchecked Sendable {
     /// buffered audio, or silence on underrun. Called from the real-time render
     /// thread: never allocates, never logs, never awaits, and never blocks.
     func read(into output: UnsafeMutableBufferPointer<Int16>, frameCount: Int) {
-        let needed = frameCount * channels
-        guard needed > 0, let base = output.baseAddress, output.count >= needed else { return }
+        guard frameCount > 0, let base = output.baseAddress else { return }
+        // Clamp to whatever the caller's span can actually hold: `frameCount` is what
+        // the render callback says it wants, but a future engine/format change could
+        // hand this a buffer smaller than `frameCount * channels`. Writing silence into
+        // the space that does exist (and still counting it as an underrun) beats
+        // returning early and leaving whatever was already in that memory — audible
+        // garbage, uncounted — playing out.
+        let needed = min(frameCount * channels, output.count)
+        guard needed > 0 else { return }
         guard os_unfair_lock_trylock(&lock) else {
             base.update(repeating: 0, count: needed)
             underrunCount.wrappingAdd(1, ordering: .relaxed)
