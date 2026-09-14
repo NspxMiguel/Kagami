@@ -192,7 +192,7 @@ final class Session {
                     guard !packet.payload.isEmpty, !packet.header.flags.contains(.error) else { continue }
                     stats.increment(\.packetsReceived)
                     stats.increment(\.bytesReceived, by: packet.payload.count)
-                    output.play(packet.payload)
+                    output.play(packet.payload, timestampMicros: packet.header.timestamp)
                 }
             } catch {
                 if !Task.isCancelled {
