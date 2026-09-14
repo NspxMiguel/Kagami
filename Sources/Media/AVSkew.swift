@@ -75,9 +75,20 @@ struct AVSkew: Sendable {
     /// `noteAudio…`. Returns the (possibly just-updated) target fill; never touches
     /// video. Tests drive `now` directly to simulate the 2 s sustain window without a
     /// real sleep.
+    ///
+    /// `videoActive` must be `false` on any tick where video did not actually display a
+    /// new frame — a stalled decoder (mid keyframe wait, or the ~2-6 s self-heal window
+    /// in `VideoIngest`) freezes `lastVideoTimestampMicros` while audio's playhead keeps
+    /// advancing normally, since audio is a wholly independent connection unaffected by
+    /// a video decoder failure. Without this, that gap grows without bound for as long
+    /// as video stays stuck and reads as "audio is lagging" — which is backwards: audio
+    /// is fine, video is the one that stopped, and nudging `targetFillSeconds` in
+    /// response would only mistune a buffer that was never the problem. Ignoring the
+    /// tick — not resetting the estimator outright — means a persistent skew that
+    /// predates the stall is still there, correctly, the moment video resumes.
     @discardableResult
-    mutating func tick(now: ContinuousClock.Instant = .now) -> Double {
-        guard let skew, magnitude(skew) > Self.nudgeThreshold else {
+    mutating func tick(now: ContinuousClock.Instant = .now, videoActive: Bool = true) -> Double {
+        guard videoActive, let skew, magnitude(skew) > Self.nudgeThreshold else {
             outOfBoundsSince = nil
             return targetFillSeconds
         }

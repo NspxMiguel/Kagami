@@ -251,7 +251,7 @@ final class Session {
                 previousCount = count
                 previousTime = now
                 if let count { stats.set(\.framesDisplayed, to: count) }
-                updateAudioVideoSkew(now: now)
+                updateAudioVideoSkew(now: now, videoActive: displayedThisTick > 0)
                 logDiagnosticsIfEnabled(framesDisplayedPerSecond: framesPerSecond)
                 // `.streaming` is derived here, once a second, rather than the moment a
                 // frame is decoded: that per-frame update used to mean a main-actor hop
@@ -282,8 +282,18 @@ final class Session {
     /// whatever nudge it computes back to the ring buffer's target fill, and copies the
     /// audio-side counters into `stats` for the diagnostics line. Never touches video —
     /// only `audio.setTargetFillSeconds` is ever adjusted here.
-    private func updateAudioVideoSkew(now: ContinuousClock.Instant) {
-        if let videoTimestamp = decoder.displayedTimestampMicros {
+    ///
+    /// `videoActive` is this tick's own `displayedThisTick > 0` from the watchdog loop —
+    /// whether a *new* frame actually reached the screen this second, not merely whether
+    /// one ever has. A stalled decoder (a keyframe wait, or `VideoIngest`'s self-heal
+    /// window) leaves `decoder.displayedTimestampMicros` sitting at its last value while
+    /// audio's playhead keeps advancing on its own independent connection; feeding that
+    /// unchanged timestamp to `AVSkew` regardless would read as ever-growing audio lag
+    /// and both mistune the nudge and paint a misleading `avSkewMicros` in diagnostics.
+    /// See `AVSkew.tick`'s own header for why ignoring the tick, not resetting the
+    /// estimator, is the right response.
+    private func updateAudioVideoSkew(now: ContinuousClock.Instant, videoActive: Bool) {
+        if videoActive, let videoTimestamp = decoder.displayedTimestampMicros {
             avSkew.noteVideoDisplayed(timestampMicros: videoTimestamp)
         }
         guard let audio, let snapshot = audio.playheadSnapshot() else { return }
@@ -291,8 +301,8 @@ final class Session {
             newestWrittenTimestampMicros: snapshot.newestWrittenTimestampMicros,
             fill: snapshot.fill, outputLatency: snapshot.outputLatency)
         stats.set(\.audioFillMillis, to: milliseconds(snapshot.fill))
-        if let skew = avSkew.skew { stats.set(\.avSkewMicros, to: microseconds(skew)) }
-        audio.setTargetFillSeconds(avSkew.tick(now: now))
+        if videoActive, let skew = avSkew.skew { stats.set(\.avSkewMicros, to: microseconds(skew)) }
+        audio.setTargetFillSeconds(avSkew.tick(now: now, videoActive: videoActive))
         stats.set(\.audioSamplesTrimmed, to: audio.trimmedSamplesTotal)
         stats.set(\.audioUnderruns, to: audio.underrunsTotal)
     }

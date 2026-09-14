@@ -79,6 +79,43 @@ final class AVSkewTests: XCTestCase {
         XCTAssertEqual(skew.targetFillSeconds, AVSkew.targetFillBounds.lowerBound)
     }
 
+    /// A stalled video decoder (a keyframe wait, or a self-heal window) leaves
+    /// `noteVideoDisplayed` uncalled while audio keeps advancing on its own,
+    /// independent connection — `videoActive: false` on those ticks must not let that
+    /// growing, one-sided gap read as sustained skew and nudge `targetFillSeconds`,
+    /// even though the *last-known* skew value would otherwise clear the threshold.
+    func testInactiveVideoTicksNeverNudgeEvenWhenLastKnownSkewIsPastThreshold() {
+        var skew = AVSkew(initialTargetFillSeconds: 0.040)
+        var now = ContinuousClock.now
+        let baseMicros: UInt64 = 200_000_000
+
+        // One real sample pair, comfortably past the 80 ms threshold.
+        skew.noteVideoDisplayed(timestampMicros: baseMicros)
+        skew.noteAudioPlayhead(newestWrittenTimestampMicros: baseMicros - 150_000, fill: .zero)
+        XCTAssertNotNil(skew.skew)
+
+        // Video stalls: nothing calls `noteVideoDisplayed` again, exactly like
+        // `Session.updateAudioVideoSkew` skipping it while `displayedThisTick == 0`.
+        // Ticking for well over the 2 s sustain window must still not nudge.
+        for _ in 0..<5 {
+            now += .seconds(1)
+            let result = skew.tick(now: now, videoActive: false)
+            XCTAssertEqual(result, 0.040, "an inactive video tick must never nudge")
+        }
+
+        // Video resumes with the same persistent gap: NOW a fresh sustain window
+        // should start and eventually nudge, proving this is "ignore", not "reset".
+        for _ in 0..<3 {
+            now += .seconds(1)
+            skew.noteVideoDisplayed(timestampMicros: baseMicros)
+            skew.noteAudioPlayhead(newestWrittenTimestampMicros: baseMicros - 150_000, fill: .zero)
+            _ = skew.tick(now: now, videoActive: true)
+        }
+        XCTAssertLessThan(
+            skew.targetFillSeconds, 0.040,
+            "the persistent gap should still be there and nudge once video is active again")
+    }
+
     /// A timestamp older than the last one reported — a console restart, or a fresh
     /// connection after a reconnect — must reset the estimator rather than reporting a
     /// nonsensical skew across the discontinuity.
