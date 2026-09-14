@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import OSLog
+import Synchronization
 
 /// One TCP connection to the console: video or audio, never both.
 ///
@@ -226,36 +227,52 @@ actor SysDVRStream {
     /// each one is what makes this actually mean idle.
     private static let readIdleTimeout = Duration.seconds(3)
 
+    /// Assembles `count` bytes, racing one long-lived idle watchdog against a loop of
+    /// partial reads for the whole call — not one fresh `TaskGroup` and sleep per
+    /// partial read. A single header or payload can arrive across many small TCP
+    /// segments (exactly the busy-scene, high-bitrate case this pipeline exists for),
+    /// and the previous shape paid for a new task group plus a new 3 s timer task on
+    /// every one of those partial deliveries, only to tear both down a moment later —
+    /// real, avoidable overhead on the hottest path in the app for no behavioural gain.
+    ///
+    /// The watchdog is a single task that wakes up, re-reads `deadline`, and either
+    /// throws (nothing has extended it since the last time it looked) or goes back to
+    /// sleep for however much of the window is left. `deadline` is pushed forward by
+    /// `readLoop` after every partial delivery, so the watchdog always ends up sleeping
+    /// against the freshest deadline by the time it actually throws — it just may take
+    /// one extra wake-and-recheck cycle to notice a push that landed while it was
+    /// already asleep, never an early or a missed timeout.
     private func receiveExactly(_ count: Int) async throws -> Data {
         guard count > 0 else { return Data() }
-        var buffer = Data()
-        buffer.reserveCapacity(count)
-        while buffer.count < count {
-            buffer.append(try await receiveSomeWithIdleTimeout(upTo: count - buffer.count))
-        }
-        return buffer
-    }
+        let deadline = DeadlineBox(ContinuousClock.now.advanced(by: Self.readIdleTimeout))
 
-    /// Waits for at least one byte (and at most `maximumLength`), racing that against
-    /// the idle timeout. Called in a loop by `receiveExactly` so the timeout restarts
-    /// after every delivery instead of covering one whole multi-byte read.
-    private func receiveSomeWithIdleTimeout(upTo maximumLength: Int) async throws -> Data {
-        try await withTaskCancellationHandler {
+        return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withThrowingTaskGroup(of: Data.self) { group in
-                group.addTask { try await self.rawReceive(maximumLength: maximumLength) }
                 group.addTask {
-                    try await Task.sleep(for: Self.readIdleTimeout)
-                    throw Failure.timedOut
+                    var buffer = Data()
+                    buffer.reserveCapacity(count)
+                    while buffer.count < count {
+                        buffer.append(try await self.rawReceive(maximumLength: count - buffer.count))
+                        deadline.value = .now.advanced(by: Self.readIdleTimeout)
+                    }
+                    return buffer
+                }
+                group.addTask {
+                    while true {
+                        let remaining = ContinuousClock.now.duration(to: deadline.value)
+                        guard remaining > .zero else { throw Failure.timedOut }
+                        try await Task.sleep(for: remaining)
+                    }
                 }
                 // `group.next()` returns as soon as either task finishes, but exiting
                 // this scope still has to wait for BOTH to actually complete — a
                 // `cancelAll()` only sets the flag `Task.isCancelled` reads, it does not
                 // itself unblock a continuation. So when the timeout wins the race, the
-                // losing `rawReceive` would otherwise hang here forever: nothing was
-                // ever going to resume its continuation, because the peer really did
-                // stop sending. `rawReceive` cancels the connection from its own
-                // `onCancel` handler for exactly this reason — that is what turns this
+                // losing read loop would otherwise hang here forever: nothing was ever
+                // going to resume its continuation, because the peer really did stop
+                // sending. `rawReceive` cancels the connection from its own `onCancel`
+                // handler for exactly this reason — that is what turns this
                 // `cancelAll()` into a real, timely unblock instead of a wait that never
                 // ends.
                 let first = try await group.next()!
@@ -290,6 +307,21 @@ actor SysDVRStream {
             // actually fire so this task can finish instead of hanging.
             self.connection.cancel()
         }
+    }
+}
+
+/// A shared, mutable deadline `receiveExactly`'s two racing child tasks both read and
+/// push forward. A plain `Mutex` captured directly by both closures compiles, but the
+/// compiler's region-based isolation checker cannot prove a non-copyable value shared
+/// this way is race-free from an actor-isolated method — wrapping it in an ordinary
+/// reference type sidesteps that ambiguity: a class reference is unambiguously a single
+/// shared value, backed by the same `Mutex` for the actual thread safety.
+private final class DeadlineBox: @unchecked Sendable {
+    private let mutex: Mutex<ContinuousClock.Instant>
+    init(_ instant: ContinuousClock.Instant) { mutex = Mutex(instant) }
+    var value: ContinuousClock.Instant {
+        get { mutex.withLock { $0 } }
+        set { mutex.withLock { $0 = newValue } }
     }
 }
 
