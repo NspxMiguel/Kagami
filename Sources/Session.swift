@@ -40,6 +40,10 @@ final class Session {
     private var watchdog: Task<Void, Never>?
     private var audio: AudioOutput?
     private var lastFrameAt = ContinuousClock.now
+    /// Read and nudged once a second by the watchdog, from the video slot's own
+    /// last-displayed timestamp and the audio output's playhead snapshot — never from
+    /// either receive loop, so this stays off the per-packet hot path entirely.
+    private var avSkew = AVSkew()
 
     init() {
         let defaults = UserDefaults.standard
@@ -66,6 +70,7 @@ final class Session {
         decoder.reset()
         stats.reset()
         framesPerSecond = 0
+        avSkew = AVSkew()
         state = .connecting
         // Captured once, synchronously, while still on the main actor: `runVideo` is
         // nonisolated and runs its decode loop off the main actor entirely, so it must
@@ -236,6 +241,7 @@ final class Session {
                 previousCount = count
                 previousTime = now
                 if let count { stats.set(\.framesDisplayed, to: count) }
+                updateAudioVideoSkew(now: now)
                 logDiagnosticsIfEnabled(framesDisplayedPerSecond: framesPerSecond)
                 // `.streaming` is derived here, once a second, rather than the moment a
                 // frame is decoded: that per-frame update used to mean a main-actor hop
@@ -254,6 +260,26 @@ final class Session {
                 }
             }
         }
+    }
+
+    /// Once a second, off the per-packet hot path entirely: feeds `AVSkew` the video
+    /// slot's last-displayed timestamp and the audio output's playhead snapshot, applies
+    /// whatever nudge it computes back to the ring buffer's target fill, and copies the
+    /// audio-side counters into `stats` for the diagnostics line. Never touches video —
+    /// only `audio.setTargetFillSeconds` is ever adjusted here.
+    private func updateAudioVideoSkew(now: ContinuousClock.Instant) {
+        if let videoTimestamp = decoder.displayedTimestampMicros {
+            avSkew.noteVideoDisplayed(timestampMicros: videoTimestamp)
+        }
+        guard let audio, let snapshot = audio.playheadSnapshot() else { return }
+        avSkew.noteAudioPlayhead(
+            newestWrittenTimestampMicros: snapshot.newestWrittenTimestampMicros,
+            fill: snapshot.fill, outputLatency: snapshot.outputLatency)
+        stats.set(\.audioFillMillis, to: milliseconds(snapshot.fill))
+        if let skew = avSkew.skew { stats.set(\.avSkewMicros, to: microseconds(skew)) }
+        audio.setTargetFillSeconds(avSkew.tick(now: now))
+        stats.set(\.audioSamplesTrimmed, to: audio.trimmedSamplesTotal)
+        stats.set(\.audioUnderruns, to: audio.underrunsTotal)
     }
 
     private func fail(_ message: String, token: UUID) {

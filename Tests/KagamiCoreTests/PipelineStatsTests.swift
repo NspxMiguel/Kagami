@@ -59,6 +59,8 @@ final class PipelineStatsTests: XCTestCase {
         snapshot.audioSamplesTrimmed = 6
         snapshot.audioUnderruns = 1
         snapshot.receiveBacklogMillis = 37
+        snapshot.avSkewMicros = -12_000
+        snapshot.audioFillMillis = 42
 
         let line = snapshot.diagnosticsLine(framesDisplayedPerSecond: 30)
 
@@ -87,6 +89,8 @@ final class PipelineStatsTests: XCTestCase {
                 "audioSamplesTrimmed": 6,
                 "audioUnderruns": 1,
                 "receiveBacklogMillis": 37,
+                "avSkewMicros": -12_000,
+                "audioFillMillis": 42,
             ])
     }
 

@@ -19,6 +19,10 @@ final class DecodedVideo {
     /// second from here, never per frame, so going through the pump's own lock is fine.
     var frame: CVPixelBuffer? { surface?.latestPresentedFrame }
 
+    /// The console timestamp of the frame currently on screen, for `AVSkew`. Same
+    /// read-a-few-times-a-second contract as `frame` above.
+    var displayedTimestampMicros: UInt64? { surface?.latestPresentedTimestampMicros }
+
     func reset() {
         _ = slot.take()
         surface?.clear()
@@ -70,6 +74,7 @@ final class VideoSurfaceView: UIView {
     }
 
     var latestPresentedFrame: CVPixelBuffer? { pump?.latestPresentedFrame }
+    var latestPresentedTimestampMicros: UInt64? { pump?.latestPresentedTimestampMicros }
 
     func clear() {
         pump?.stop()
@@ -100,6 +105,7 @@ final class VideoPump: @unchecked Sendable {
     private var format: CMVideoFormatDescription?
     private let requesting = Mutex(false)
     private let lastPresented = Mutex<CVPixelBuffer?>(nil)
+    private let lastPresentedTimestamp = Mutex<UInt64?>(nil)
 
     init(renderer: AVSampleBufferVideoRenderer, slot: LatestFrameSlot) {
         self.renderer = renderer
@@ -108,6 +114,7 @@ final class VideoPump: @unchecked Sendable {
     }
 
     var latestPresentedFrame: CVPixelBuffer? { lastPresented.withLock { $0 } }
+    var latestPresentedTimestampMicros: UInt64? { lastPresentedTimestamp.withLock { $0 } }
 
     /// Wakes the pump when a new frame lands. `requestMediaDataWhenReady` is only
     /// re-armed if it was actually stopped — calling it while already active would just
@@ -174,5 +181,6 @@ final class VideoPump: @unchecked Sendable {
             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         renderer.enqueue(sample)
         lastPresented.withLock { $0 = frame.buffer }
+        lastPresentedTimestamp.withLock { $0 = frame.timestampMicros }
     }
 }

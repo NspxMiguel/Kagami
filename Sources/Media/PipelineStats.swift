@@ -30,6 +30,14 @@ final class PipelineStats: Sendable {
         /// milliseconds — how far behind live the pipeline is right now, not a historical
         /// average.
         var receiveBacklogMillis = 0
+        /// `AVSkew`'s own measurement of how far apart the video and audio outputs are,
+        /// in microseconds: positive means video is ahead (audio lagging). Microseconds
+        /// rather than milliseconds because the 80 ms nudge threshold needs to resolve
+        /// well below a whole millisecond of noise.
+        var avSkewMicros = 0
+        /// The audio ring buffer's current fill, in milliseconds — what `AVSkew` reads
+        /// as the audio playhead's distance from the newest write.
+        var audioFillMillis = 0
     }
 
     private let state = Mutex(Snapshot())
@@ -77,6 +85,8 @@ extension PipelineStats.Snapshot {
             ("audioSamplesTrimmed", audioSamplesTrimmed),
             ("audioUnderruns", audioUnderruns),
             ("receiveBacklogMillis", receiveBacklogMillis),
+            ("avSkewMicros", avSkewMicros),
+            ("audioFillMillis", audioFillMillis),
         ]
         let body = fields.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
         return "{\(body)}"
@@ -90,4 +100,11 @@ extension PipelineStats.Snapshot {
 func milliseconds(_ duration: Duration) -> Int {
     let components = duration.components
     return Int(components.seconds) * 1000 + Int(components.attoseconds / 1_000_000_000_000_000)
+}
+
+/// Same idea as `milliseconds(_:)` above, at finer resolution: `AVSkew`'s 80 ms nudge
+/// threshold needs to resolve well below a whole millisecond of rounding noise.
+func microseconds(_ duration: Duration) -> Int {
+    let components = duration.components
+    return Int(components.seconds) * 1_000_000 + Int(components.attoseconds / 1_000_000_000_000)
 }
