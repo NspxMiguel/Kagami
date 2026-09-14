@@ -72,7 +72,16 @@ actor H264Decoder {
     /// access unit — but VideoToolbox is asked not to bother producing a `CVPixelBuffer`
     /// for it, which is how the pipeline catches up to the live edge after a stall
     /// without ever waiting for a keyframe.
-    func decode(_ accessUnit: Data, timestampMicros: UInt64, suppressOutput: Bool = false) throws {
+    ///
+    /// Returns the produced frame, if this call actually produced one — `nil` while
+    /// waiting for a keyframe, while suppressing output, or if this access unit carried
+    /// no picture. The same frame is also yielded to `frames`; this return value only
+    /// exists so a caller already holding this actor (`VideoIngest`, for the ambient
+    /// sampler) can use it without a second hop through the async stream.
+    @discardableResult
+    func decode(_ accessUnit: Data, timestampMicros: UInt64, suppressOutput: Bool = false) throws
+        -> DecodedFrame?
+    {
         // One pass over the buffer does all of it: pulls out SPS/PPS (glued to every
         // keyframe because SysDVR is asked to inject them), notices whether this is a
         // keyframe, and leaves the picture already length-prefixed for VideoToolbox.
@@ -103,7 +112,8 @@ actor H264Decoder {
         }
 
         if parsed.isKeyframe { endKeyframeWaitIfNeeded() }
-        guard !waitingForKeyframe, let session, let format, !parsed.lengthPrefixedPicture.isEmpty else { return }
+        guard !waitingForKeyframe, let session, let format, !parsed.lengthPrefixedPicture.isEmpty
+        else { return nil }
 
         let block = parsed.lengthPrefixedPicture
         var length = block.count
@@ -146,7 +156,9 @@ actor H264Decoder {
                 sampleBufferOut: &sample)
             guard sampleStatus == noErr, let sample else { throw DecodeFailure(status: sampleStatus) }
 
-            try submit(sample, session: session, timestampMicros: timestampMicros, suppressOutput: suppressOutput)
+            return try submit(
+                sample, session: session, timestampMicros: timestampMicros,
+                suppressOutput: suppressOutput)
         } catch {
             enterKeyframeWait()
             throw error
@@ -191,18 +203,22 @@ actor H264Decoder {
     private func submit(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         suppressOutput: Bool
-    ) throws {
+    ) throws -> DecodedFrame? {
         let first = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: suppressOutput)
         let outcome: DecodeOutcome
-        if Self.shouldRetryWithoutHint(after: first, suppressOutput: suppressOutput) {
+        let frame: DecodedFrame?
+        if Self.shouldRetryWithoutHint(after: first.outcome, suppressOutput: suppressOutput) {
             log.notice("VideoToolbox rejected kVTDecodeFrame_DoNotOutputFrame; falling back to a normal decode")
-            outcome = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
+            let retry = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
+            outcome = retry.outcome
+            frame = retry.frame
         } else {
-            outcome = first
+            outcome = first.outcome
+            frame = first.frame
         }
         switch outcome {
         case .success:
-            return
+            return frame
         case .rejectedSynchronously(let status):
             enterKeyframeWait()
             throw DecodeFailure(status: status)
@@ -215,10 +231,11 @@ actor H264Decoder {
     private func attemptDecode(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         doNotOutput: Bool
-    ) -> DecodeOutcome {
+    ) -> (outcome: DecodeOutcome, frame: DecodedFrame?) {
         let continuation = self.continuation
         let stats = self.stats
         let callbackStatus = Mutex<OSStatus>(noErr)
+        let producedFrame = Mutex<DecodedFrame?>(nil)
         // Without `.enableAsynchronousDecompression` the callback is documented to fire
         // before `VTDecompressionSessionDecodeFrame` returns, but that is a hint about
         // typical decoder behaviour, not a contract every hardware decoder honours.
@@ -240,7 +257,9 @@ actor H264Decoder {
                 // finished and is only ever read from here on — the drawing side never
                 // writes to it.
                 stats?.increment(\.framesDecoded)
-                continuation.yield(DecodedFrame(buffer: image, timestampMicros: timestampMicros))
+                let frame = DecodedFrame(buffer: image, timestampMicros: timestampMicros)
+                producedFrame.withLock { $0 = frame }
+                continuation.yield(frame)
             }
             done.signal()
         }
@@ -248,7 +267,7 @@ actor H264Decoder {
         // per Apple's documented contract for VTDecompressionSessionDecodeFrame, the
         // callback fires if and only if the frame was accepted (status == noErr from
         // this call), so no callback will ever follow and there is nothing pending.
-        guard status == noErr else { return .rejectedSynchronously(status) }
+        guard status == noErr else { return (.rejectedSynchronously(status), nil) }
         // Bounded well above the ~2 ms measured decode cost and the 33 ms frame budget,
         // so a genuinely wedged decoder cannot hang this actor forever — it is treated
         // as a decode error (a real one, since nothing decoded). Unlike the synchronous
@@ -256,10 +275,11 @@ actor H264Decoder {
         // this case must never be treated as safe to resubmit.
         if done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
             log.error("VideoToolbox decode callback did not fire within 200ms")
-            return .timedOut
+            return (.timedOut, nil)
         }
         let final = callbackStatus.withLock { $0 }
-        return final == noErr ? .success : .rejectedSynchronously(final)
+        let outcome: DecodeOutcome = final == noErr ? .success : .rejectedSynchronously(final)
+        return (outcome, producedFrame.withLock { $0 })
     }
 
     private func enterKeyframeWait() {

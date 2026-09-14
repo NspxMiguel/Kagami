@@ -24,6 +24,11 @@ actor VideoIngest {
     private let decoder: H264Decoder
     private let stats: PipelineStats
     private var timeline = StreamTimeline()
+    /// Owns the ambient-colour reduction described in `AmbientSampler`'s own header.
+    /// Fed every successfully decoded picture; the sampler decides for itself, by the
+    /// console's own clock, whether 250 ms have passed and whether the colour actually
+    /// changed enough to be worth publishing.
+    private let ambient = AmbientSampler()
 
     /// The decoder's own decoded-frame stream, forwarded so callers never need to know
     /// this actor wraps one.
@@ -44,9 +49,16 @@ actor VideoIngest {
 
         stats.increment(\.decodeCalls)
         do {
-            try await decoder.decode(
+            let frame = try await decoder.decode(
                 packet.payload, timestampMicros: packet.header.timestamp,
                 suppressOutput: backlog > Self.oneFrameBudget)
+            // `frame` is `nil` for every suppressed access unit (VideoToolbox never
+            // produces a picture for those), so this already only ever sees "the
+            // newest decoded buffer" the plan calls for — no separate freshness check
+            // needed here.
+            if let frame, let colour = await ambient.sample(frame) {
+                stats.setAmbientColor(colour)
+            }
         } catch {
             // A decode error is not a dead connection. `H264Decoder` has already
             // recovered in place — it enters its own keyframe wait before it ever
@@ -65,6 +77,7 @@ actor VideoIngest {
 
     func reset() async {
         await decoder.reset()
+        await ambient.reset()
         timeline = StreamTimeline()
     }
 

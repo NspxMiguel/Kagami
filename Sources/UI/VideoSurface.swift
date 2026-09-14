@@ -15,12 +15,9 @@ final class DecodedVideo {
         didSet { slot.stats = stats }
     }
 
-    /// The frame currently on screen, for the ambient-light sampler. Read a few times a
-    /// second from here, never per frame, so going through the pump's own lock is fine.
-    var frame: CVPixelBuffer? { surface?.latestPresentedFrame }
-
-    /// The console timestamp of the frame currently on screen, for `AVSkew`. Same
-    /// read-a-few-times-a-second contract as `frame` above.
+    /// The console timestamp of the frame currently on screen, for `AVSkew`. Read a
+    /// few times a second from here, never per frame, so going through the pump's own
+    /// lock is fine.
     var displayedTimestampMicros: UInt64? { surface?.latestPresentedTimestampMicros }
 
     func reset() {
@@ -73,7 +70,6 @@ final class VideoSurfaceView: UIView {
         pump.frameAvailable()  // in case a frame was already waiting when this attached
     }
 
-    var latestPresentedFrame: CVPixelBuffer? { pump?.latestPresentedFrame }
     var latestPresentedTimestampMicros: UInt64? { pump?.latestPresentedTimestampMicros }
 
     func clear() {
@@ -104,7 +100,6 @@ final class VideoPump: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.kagami.app.render")
     private var format: CMVideoFormatDescription?
     private let requesting = Mutex(false)
-    private let lastPresented = Mutex<CVPixelBuffer?>(nil)
     private let lastPresentedTimestamp = Mutex<UInt64?>(nil)
 
     init(renderer: AVSampleBufferVideoRenderer, slot: LatestFrameSlot) {
@@ -113,7 +108,6 @@ final class VideoPump: @unchecked Sendable {
         slot.setDidWrite { [weak self] in self?.frameAvailable() }
     }
 
-    var latestPresentedFrame: CVPixelBuffer? { lastPresented.withLock { $0 } }
     var latestPresentedTimestampMicros: UInt64? { lastPresentedTimestamp.withLock { $0 } }
 
     /// Wakes the pump when a new frame lands. `requestMediaDataWhenReady` is only
@@ -180,7 +174,6 @@ final class VideoPump: @unchecked Sendable {
             Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         renderer.enqueue(sample)
-        lastPresented.withLock { $0 = frame.buffer }
         lastPresentedTimestamp.withLock { $0 = frame.timestampMicros }
     }
 }

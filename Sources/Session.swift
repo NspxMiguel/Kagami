@@ -254,6 +254,11 @@ final class Session {
                     case .connecting, .waitingForGame, .reconnecting: state = .streaming
                     default: break
                     }
+                    // Only relayed while frames are actually arriving: `stats` outlives
+                    // any one connection, so a stale colour from before a drop must
+                    // never leak back in here once the "no frames" branch below has
+                    // already zeroed it for a dark, no-signal room.
+                    if let colour = stats.ambientColor() { ambientComponents = colour }
                 } else if state == .streaming, lastFrameAt.duration(to: now) > .seconds(2) {
                     state = .waitingForGame
                     ambientComponents = (0, 0, 0)

@@ -14,7 +14,7 @@ let package = Package(
             sources: [
                 "Protocol", "Media/VideoDecoder.swift", "Media/PipelineStats.swift",
                 "Media/VideoIngest.swift", "Media/LatestFrameSlot.swift",
-                "Media/PCMRingBuffer.swift", "Media/AVSkew.swift",
+                "Media/PCMRingBuffer.swift", "Media/AVSkew.swift", "Media/AmbientSampler.swift",
             ]),
         .testTarget(
             name: "KagamiCoreTests", dependencies: ["KagamiCore"],

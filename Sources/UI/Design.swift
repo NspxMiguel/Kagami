@@ -27,9 +27,6 @@ enum Design {
         static let value = Animation.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.22)
         /// A panel, a screen.
         static let panel = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.4)
-        /// The ambient light following the picture. Slow on purpose: matching the frame
-        /// rate would strobe the room on every cut.
-        static let ambient = Animation.easeInOut(duration: 1.2)
     }
 
     /// Numbers are monospaced — frame counters that reflow on every digit look broken.

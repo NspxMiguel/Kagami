@@ -41,6 +41,12 @@ final class PipelineStats: Sendable {
     }
 
     private let state = Mutex(Snapshot())
+    /// The theater's ambient colour, as `AmbientSampler` computes it. Kept outside
+    /// `Snapshot` because it is not a counter and has no business in the JSON
+    /// diagnostics line, but it rides the same contract as every counter here: written
+    /// from the ingest pipeline off the main actor, read a few times a second by the
+    /// watchdog, never the other way around.
+    private let ambientColorState = Mutex<(r: Double, g: Double, b: Double)?>(nil)
 
     /// Adds `amount` to one counter. Safe to call from any thread or actor.
     func increment(_ counter: WritableKeyPath<Snapshot, Int>, by amount: Int = 1) {
@@ -57,8 +63,17 @@ final class PipelineStats: Sendable {
         state.withLock { $0 }
     }
 
+    func setAmbientColor(_ color: (r: Double, g: Double, b: Double)) {
+        ambientColorState.withLock { $0 = color }
+    }
+
+    func ambientColor() -> (r: Double, g: Double, b: Double)? {
+        ambientColorState.withLock { $0 }
+    }
+
     func reset() {
         state.withLock { $0 = Snapshot() }
+        ambientColorState.withLock { $0 = nil }
     }
 }
 

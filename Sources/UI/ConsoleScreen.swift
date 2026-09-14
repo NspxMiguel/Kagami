@@ -1,12 +1,19 @@
-import CoreVideo
 import SwiftUI
-import VideoToolbox
 
 /// The console's picture, floating in the room.
 struct ConsoleScreen: View {
     @Environment(Session.self) private var session
-    @State private var ambient = AmbientLight()
-    @State private var glow: Color = .clear
+
+    /// The light of the game, thrown past the edges of the screen. Sourced straight
+    /// from `session.ambientComponents` — `VideoIngest`'s own `AmbientSampler` computes
+    /// it deep in the pipeline and publishes at most a few times a second, so there is
+    /// nothing left for this view to sample or animate on its own. `.clear` off-stream
+    /// so the spill disappears instead of leaving a black blur over the empty screen.
+    private var glow: Color {
+        guard session.state == .streaming else { return .clear }
+        let components = session.ambientComponents
+        return Color(red: components.r, green: components.g, blue: components.b)
+    }
 
     var body: some View {
         ZStack {
@@ -15,8 +22,8 @@ struct ConsoleScreen: View {
         }
         .aspectRatio(16.0 / 9.0, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: Design.Radius.screen, style: .continuous))
-        // The light of the game, thrown past the edges of the screen. Sits behind the
-        // picture and outside it, which is why it reads as spill rather than a border.
+        // Sits behind the picture and outside it, which is why it reads as spill
+        // rather than a border.
         .background {
             RoundedRectangle(cornerRadius: Design.Radius.screen, style: .continuous)
                 .fill(glow)
@@ -24,22 +31,6 @@ struct ConsoleScreen: View {
                 .opacity(0.55)
                 .padding(-28)
                 .allowsHitTesting(false)
-        }
-        .animation(Design.Motion.ambient, value: glow)
-        .task {
-            while !Task.isCancelled {
-                if session.state == .streaming, let frame = session.decoder.frame {
-                    if let components = await ambient.sample(DecodedFrame(buffer: frame)),
-                        !Task.isCancelled, session.state == .streaming
-                    {
-                        glow = Color(red: components.r, green: components.g, blue: components.b)
-                        session.ambientComponents = components
-                    }
-                } else {
-                    glow = .clear
-                }
-                do { try await Task.sleep(for: .milliseconds(220)) } catch { return }
-            }
         }
     }
 
