@@ -1,6 +1,5 @@
 import CoreMedia
 import CoreVideo
-import Dispatch
 import Foundation
 import OSLog
 import Synchronization
@@ -32,6 +31,21 @@ actor H264Decoder {
     /// constructor's initial default), so `keyframeWaitMillisTotal` never counts the
     /// time before the very first packet arrives.
     private var keyframeWaitStartedAt: ContinuousClock.Instant?
+    /// Identifies which submission VideoToolbox's completion callback is allowed to
+    /// actually deliver a frame for. Bumped by `reset()` and by `enterKeyframeWait()` —
+    /// every point where this decoder declares the reference chain broken and moves on
+    /// — and read from inside the completion closure itself, which runs on VideoToolbox's
+    /// own thread rather than this actor's. A plain `Mutex` rather than actor-isolated
+    /// state is exactly what makes that possible without a hop back onto the actor.
+    ///
+    /// This exists because `kVTDecodeFrame_DoNotOutputFrame`'s callback ordering is
+    /// "a hint about typical decoder behaviour, not a contract every hardware decoder
+    /// honours" (see `attemptDecode`), so a submission this decoder has already given up
+    /// on — a timeout, a rebuilt session, a reset — can still have its callback fire
+    /// later with a perfectly good image. Without this check that stale image would be
+    /// pushed to the screen exactly like a fresh one, decoded against a reference chain
+    /// this decoder itself already declared suspect.
+    private let epoch = Mutex<UInt64>(0)
 
     init(stats: PipelineStats? = nil) {
         self.stats = stats
@@ -52,6 +66,7 @@ actor H264Decoder {
         parameterSets = []
         waitingForKeyframe = true
         keyframeWaitStartedAt = nil
+        epoch.withLock { $0 &+= 1 }
     }
 
     func finish() {
@@ -79,8 +94,8 @@ actor H264Decoder {
     /// exists so a caller already holding this actor (`VideoIngest`, for the ambient
     /// sampler) can use it without a second hop through the async stream.
     @discardableResult
-    func decode(_ accessUnit: Data, timestampMicros: UInt64, suppressOutput: Bool = false) throws
-        -> DecodedFrame?
+    func decode(_ accessUnit: Data, timestampMicros: UInt64, suppressOutput: Bool = false)
+        async throws -> DecodedFrame?
     {
         // One pass over the buffer does all of it: pulls out SPS/PPS (glued to every
         // keyframe because SysDVR is asked to inject them), notices whether this is a
@@ -156,7 +171,7 @@ actor H264Decoder {
                 sampleBufferOut: &sample)
             guard sampleStatus == noErr, let sample else { throw DecodeFailure(status: sampleStatus) }
 
-            return try submit(
+            return try await submit(
                 sample, session: session, timestampMicros: timestampMicros,
                 suppressOutput: suppressOutput)
         } catch {
@@ -203,13 +218,13 @@ actor H264Decoder {
     private func submit(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         suppressOutput: Bool
-    ) throws -> DecodedFrame? {
-        let first = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: suppressOutput)
+    ) async throws -> DecodedFrame? {
+        let first = await attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: suppressOutput)
         let outcome: DecodeOutcome
         let frame: DecodedFrame?
         if Self.shouldRetryWithoutHint(after: first.outcome, suppressOutput: suppressOutput) {
             log.notice("VideoToolbox rejected kVTDecodeFrame_DoNotOutputFrame; falling back to a normal decode")
-            let retry = attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
+            let retry = await attemptDecode(sample, session: session, timestampMicros: timestampMicros, doNotOutput: false)
             outcome = retry.outcome
             frame = retry.frame
         } else {
@@ -228,58 +243,100 @@ actor H264Decoder {
         }
     }
 
+    /// Submits one sample and waits for VideoToolbox's completion callback without
+    /// blocking any thread — the previous implementation blocked this actor's shared
+    /// cooperative-pool thread on a `DispatchSemaphore` for up to 200 ms per call, which
+    /// could starve every other actor sharing that pool (`VideoIngest`, the watchdog,
+    /// `H264Decoder.reset()`/`finish()` itself) on any VideoToolbox hiccup. A suspended
+    /// `Task.sleep` costs nothing while waiting, which is what makes this safe to do on
+    /// every single access unit instead of only occasionally.
+    ///
+    /// The timeout and the callback race to resume the same continuation exactly once
+    /// (`finish`, below); whichever loses is simply ignored rather than blocked on, the
+    /// same shape as `SysDVRStream.receiveSomeWithIdleTimeout`'s race against a dead
+    /// socket. Unlike that race, though, there is no way to force VideoToolbox's
+    /// callback to fire early the way cancelling the connection forces a pending
+    /// `receive` to complete — so a callback that loses the race is not cancelled, only
+    /// ignored, and `epoch` is what keeps its eventual, late result from ever reaching
+    /// `continuation` once this decoder has moved on.
     private func attemptDecode(
         _ sample: CMSampleBuffer, session: VTDecompressionSession, timestampMicros: UInt64,
         doNotOutput: Bool
-    ) -> (outcome: DecodeOutcome, frame: DecodedFrame?) {
+    ) async -> (outcome: DecodeOutcome, frame: DecodedFrame?) {
         let continuation = self.continuation
         let stats = self.stats
-        let callbackStatus = Mutex<OSStatus>(noErr)
-        let producedFrame = Mutex<DecodedFrame?>(nil)
-        // Without `.enableAsynchronousDecompression` the callback is documented to fire
-        // before `VTDecompressionSessionDecodeFrame` returns, but that is a hint about
-        // typical decoder behaviour, not a contract every hardware decoder honours.
-        // Waiting on this instead of reading the Mutex immediately after the call
-        // returns means a genuinely asynchronous callback is still observed correctly
-        // rather than silently read as its stale `noErr` default. The wait costs
-        // nothing in the documented (synchronous) case, because `done` is already
-        // signalled by the time this line runs.
-        let done = DispatchSemaphore(value: 0)
+        let log = self.log
+        // `Mutex` is a non-copyable type, so `epoch` itself cannot be extracted into a
+        // local the way `continuation`/`stats`/`log` are above — instead the closures
+        // below reach it through `self.epoch` directly. That is safe without `await`
+        // because it is a `let` stored property of `Sendable` type: an actor's own
+        // immutable, thread-safe state is exactly what does not need isolation to read.
+        let submissionEpoch = self.epoch.withLock { $0 }
+        let frameBox = Mutex<DecodedFrame?>(nil)
+        let resumed = Mutex(false)
         let flags: VTDecodeFrameFlags = doNotOutput ? [._DoNotOutputFrame] : []
-        let status = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sample,
-            flags: flags, infoFlagsOut: nil
-        ) { status, _, image, _, _ in
-            callbackStatus.withLock { $0 = status }
-            if status == noErr, let image {
-                // VideoToolbox calls back off the actor and CVImageBuffer is not
-                // Sendable. The box carries it across: the buffer leaves the decoder
-                // finished and is only ever read from here on — the drawing side never
-                // writes to it.
-                stats?.increment(\.framesDecoded)
-                let frame = DecodedFrame(buffer: image, timestampMicros: timestampMicros)
-                producedFrame.withLock { $0 = frame }
-                continuation.yield(frame)
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<(DecodeOutcome, DecodedFrame?), Never>) in
+            @Sendable
+            func finish(_ outcome: DecodeOutcome) {
+                let shouldResume = resumed.withLock { already -> Bool in
+                    defer { already = true }
+                    return !already
+                }
+                guard shouldResume else { return }
+                cont.resume(returning: (outcome, frameBox.withLock { $0 }))
             }
-            done.signal()
+
+            // Bounded well above the ~2 ms measured decode cost and the 33 ms frame
+            // budget, so a genuinely wedged decoder cannot hang this actor forever.
+            let timeoutTask = Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                // Bumped here, not only in the caller's later `enterKeyframeWait()`:
+                // this closes the race where VideoToolbox's callback fires in the
+                // instant right after the timeout wins but before the actor gets back
+                // around to declaring the reference chain broken.
+                self.epoch.withLock { $0 &+= 1 }
+                log.error("VideoToolbox decode callback did not fire within 200ms")
+                finish(.timedOut)
+            }
+
+            let status = VTDecompressionSessionDecodeFrame(
+                session, sampleBuffer: sample,
+                flags: flags, infoFlagsOut: nil
+            ) { status, _, image, _, _ in
+                // Whichever of the timeout task or this callback runs first cancels
+                // the other's reason to do anything further; cancelling here is what
+                // stops a callback that arrives just past 200ms from racing the
+                // timeout's own epoch bump below.
+                timeoutTask.cancel()
+                if status == noErr, let image, self.epoch.withLock({ $0 }) == submissionEpoch {
+                    // VideoToolbox calls back off the actor and CVImageBuffer is not
+                    // Sendable. The box carries it across: the buffer leaves the
+                    // decoder finished and is only ever read from here on — the
+                    // drawing side never writes to it. The epoch check above is what
+                    // makes this safe to do without being isolated to the actor: a
+                    // stale epoch means this decoder already gave up on this exact
+                    // submission (a timeout, a rebuilt session, a reset) and moved on,
+                    // so yielding this image now would push a picture decoded against
+                    // a reference chain already declared suspect.
+                    stats?.increment(\.framesDecoded)
+                    let frame = DecodedFrame(buffer: image, timestampMicros: timestampMicros)
+                    frameBox.withLock { $0 = frame }
+                    continuation.yield(frame)
+                }
+                finish(status == noErr ? .success : .rejectedSynchronously(status))
+            }
+            // A non-noErr return here means VideoToolbox rejected the submission
+            // outright — per Apple's documented contract for
+            // VTDecompressionSessionDecodeFrame, the callback fires if and only if the
+            // frame was accepted (status == noErr from this call), so no callback will
+            // ever follow and there is nothing pending to wait for.
+            if status != noErr {
+                timeoutTask.cancel()
+                finish(.rejectedSynchronously(status))
+            }
         }
-        // A non-noErr return here means VideoToolbox rejected the submission outright —
-        // per Apple's documented contract for VTDecompressionSessionDecodeFrame, the
-        // callback fires if and only if the frame was accepted (status == noErr from
-        // this call), so no callback will ever follow and there is nothing pending.
-        guard status == noErr else { return (.rejectedSynchronously(status), nil) }
-        // Bounded well above the ~2 ms measured decode cost and the 33 ms frame budget,
-        // so a genuinely wedged decoder cannot hang this actor forever — it is treated
-        // as a decode error (a real one, since nothing decoded). Unlike the synchronous
-        // rejection above, the accepted submission's callback may still fire later, so
-        // this case must never be treated as safe to resubmit.
-        if done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
-            log.error("VideoToolbox decode callback did not fire within 200ms")
-            return (.timedOut, nil)
-        }
-        let final = callbackStatus.withLock { $0 }
-        let outcome: DecodeOutcome = final == noErr ? .success : .rejectedSynchronously(final)
-        return (outcome, producedFrame.withLock { $0 })
     }
 
     private func enterKeyframeWait() {
@@ -287,6 +344,7 @@ actor H264Decoder {
         waitingForKeyframe = true
         keyframeWaitStartedAt = .now
         stats?.increment(\.keyframeWaitsEntered)
+        epoch.withLock { $0 &+= 1 }
     }
 
     private func endKeyframeWaitIfNeeded() {
