@@ -19,12 +19,6 @@ actor SysDVRStream {
         let header: SysDVR.PacketHeader
         let payload: Data
         var sequence = 0
-        // `var` rather than `let` so the memberwise initializer accepts an override —
-        // Swift only synthesizes a default-valued init parameter for a property with an
-        // initial-value expression when it is mutable. Nothing in the pipeline mutates
-        // this after construction; tests use the override to build a packet as though
-        // it arrived at a specific synthetic instant, without a real sleep.
-        var receivedAt = ContinuousClock.now
     }
 
     enum Failure: LocalizedError {

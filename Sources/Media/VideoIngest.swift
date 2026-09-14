@@ -41,9 +41,19 @@ actor VideoIngest {
         frames = decoder.frames
     }
 
-    func accept(_ packet: SysDVRStream.Packet) async throws {
+    /// `dequeuedAt` defaults to the real clock and only ever takes another value from a
+    /// test: measuring backlog from the moment this call actually starts running is the
+    /// whole fix. The stream's own reading task stamps each packet's wire-arrival time
+    /// long before this actor gets around to it, and an unbounded `AsyncThrowingStream`
+    /// never blocks that reading task waiting on a slow consumer — so if this actor
+    /// falls behind (a slow decode, a busy scheduler), packets queue up invisibly, each
+    /// one still carrying a wire-arrival timestamp that looks perfectly on time.
+    /// Resampling `now` right here, instead, means the backlog this method computes is
+    /// however far the console's live edge actually is from the moment its picture is
+    /// about to be decoded — queueing delay included, not just network transit.
+    func accept(_ packet: SysDVRStream.Packet, dequeuedAt: ContinuousClock.Instant = .now) async throws {
         let backlog = timeline.excessDelay(
-            timestampMicros: packet.header.timestamp, receivedAt: packet.receivedAt)
+            timestampMicros: packet.header.timestamp, receivedAt: dequeuedAt)
         stats.set(\.receiveBacklogMillis, to: milliseconds(backlog))
         guard backlog < Self.hardBacklogCeiling else { throw SysDVRStream.Failure.backlogExceeded }
 
