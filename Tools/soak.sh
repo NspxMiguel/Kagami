@@ -63,6 +63,16 @@ BEFORE_IPS="$(mktemp)"
 find "$REPORTS_DIR" -maxdepth 1 -iname "Kagami-*.ips" 2>/dev/null | sort > "$BEFORE_IPS"
 
 # --- 1. Build once, unless a prebuilt .app was handed to us.
+#
+# -configuration Debug is explicit and load-bearing, not cosmetic: a plain
+# "generic/platform=visionOS Simulator" destination with no -configuration defaults
+# to Release, which lands in build/Build/Products/Release-xrsimulator rather than
+# .../Debug-xrsimulator — and this script used to guess the product directory with a
+# find that silently fell back to whatever Kagami.app it found first anywhere under
+# build/Build/Products, including a stale one left over from an entirely different
+# prior build. Pinning the configuration here means there is exactly one expected
+# path, so a stale leftover under the OTHER configuration's directory can never be
+# picked by accident.
 if [[ -z "$APP_PATH" ]]; then
   if pgrep -x xcodebuild >/dev/null; then
     log "another xcodebuild is running on this Mac — waiting for it before starting ours"
@@ -71,22 +81,33 @@ if [[ -z "$APP_PATH" ]]; then
   log "generating project and building for the visionOS Simulator"
   xcodegen generate >/dev/null
   if ! xcodebuild -project Kagami.xcodeproj -scheme Kagami \
-      -destination "generic/platform=visionOS Simulator" \
+      -destination "generic/platform=visionOS Simulator" -configuration Debug \
       -derivedDataPath build build \
       > "build/soak-${LABEL}-xcodebuild.log" 2>&1; then
     log "BUILD FAILED — see build/soak-${LABEL}-xcodebuild.log"
     exit 1
   fi
-  APP_PATH="$(find build/Build/Products -maxdepth 1 -iname 'Debug-xrsimulator' -o -iname 'Release-xrsimulator' 2>/dev/null | while read -r d; do find "$d" -maxdepth 1 -iname 'Kagami.app'; done | head -1)"
-  if [[ -z "$APP_PATH" ]]; then
-    APP_PATH="$(find build/Build/Products -maxdepth 2 -iname 'Kagami.app' | head -1)"
-  fi
+  APP_PATH="build/Build/Products/Debug-xrsimulator/Kagami.app"
 fi
 if [[ -z "$APP_PATH" || ! -d "$APP_PATH" ]]; then
-  log "could not locate a built Kagami.app"
+  log "could not locate a built Kagami.app at $APP_PATH"
   exit 1
 fi
 log "using app at $APP_PATH"
+
+# Never trust the product directory alone: confirm the binary we are about to soak
+# was actually stamped from the commit we think we are testing (see
+# Tools/stamp-build.sh). A mismatch here — stale product, wrong configuration,
+# uncommitted local edits — would silently invalidate every number this script
+# reports, so it is a hard failure rather than a warning.
+EXPECTED_COMMIT="$(git rev-parse --short HEAD)"
+BUILT_COMMIT="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('commit','?'))" "$APP_PATH/BuildInfo.json" 2>/dev/null || echo "?")"
+BUILT_DIRTY="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('dirty','?'))" "$APP_PATH/BuildInfo.json" 2>/dev/null || echo "?")"
+log "app BuildInfo.json: commit=$BUILT_COMMIT dirty=$BUILT_DIRTY (expected commit=$EXPECTED_COMMIT)"
+if [[ "$BUILT_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+  log "REFUSING to soak: $APP_PATH was built from commit $BUILT_COMMIT, not HEAD ($EXPECTED_COMMIT)"
+  exit 1
+fi
 
 # --- 2. Make sure the target simulator is booted, then install.
 STATE="$(xcrun simctl list devices | grep "$UDID" | grep -oE '\(Booted\)|\(Shutdown\)' || true)"
@@ -106,7 +127,7 @@ xcrun simctl install "$UDID" "$APP_PATH"
 #        loop point mid-run and confuse that with a Kagami defect.
 FAKE_SECONDS=$((DURATION + 120))
 log "starting fake console for ${FAKE_SECONDS}s of clip (soak duration ${DURATION}s)"
-python3 Tools/fake-console.py --gop 150 --motion noise --stall-ms 800 --stall-every 5 \
+python3 -u Tools/fake-console.py --gop 150 --motion noise --stall-ms 800 --stall-every 5 \
     --seconds "$FAKE_SECONDS" > "$CONSOLE_LOG" 2>&1 &
 FAKE_PID=$!
 
@@ -125,7 +146,22 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 
-# --- 4. Launch the app.
+# --- 4. Start capturing diagnostics, then launch the app.
+#
+# `/usr/bin/log stream` (live-attach) is used here rather than `log show --start ...`
+# (query the persisted store after the fact) — measured against this exact
+# environment: a live app emitting diagnostics every second showed up over `log
+# stream` immediately, but a `log show` query against the same predicate run
+# seconds to tens of seconds later, still while the app kept running, returned
+# nothing at all. Whatever backs the persisted log store is not reliably reachable
+# from this shell; the live stream is. Started before `simctl launch` so the very
+# first diagnostics line is never missed.
+log "starting log stream capture"
+/usr/bin/log stream --predicate 'subsystem == "com.kagami.app" AND category == "diagnostics"' \
+    > "$DIAG_LOG" 2>/dev/null &
+LOG_STREAM_PID=$!
+sleep 2
+
 LAUNCH_ARGS=(-console.host 127.0.0.1 -autoConnect YES -streamDiagnostics YES)
 if [[ -n "$EXTRA_ARGS" ]]; then
   # shellcheck disable=SC2206
@@ -133,7 +169,6 @@ if [[ -n "$EXTRA_ARGS" ]]; then
 fi
 log "launching app with: ${LAUNCH_ARGS[*]}"
 LAUNCH_START_EPOCH=$(date +%s)
-LAUNCH_START_LOGSHOW="$(date -u '+%Y-%m-%d %H:%M:%S+0000')"
 LAUNCH_OUT="$(xcrun simctl launch "$UDID" "$BUNDLE_ID" "${LAUNCH_ARGS[@]}" 2>&1)"
 echo "$LAUNCH_OUT"
 APP_PID="$(echo "$LAUNCH_OUT" | grep -oE '[0-9]+$' | tail -1)"
@@ -171,20 +206,21 @@ while [[ $(date +%s) -lt $END_EPOCH ]]; do
     CRASH_FILE="$NEW_IPS"
     break
   fi
-  sleep 60
+  REMAINING=$((END_EPOCH - NOW))
+  if [[ $REMAINING -le 0 ]]; then break; fi
+  if [[ $REMAINING -lt 60 ]]; then sleep "$REMAINING"; else sleep 60; fi
 done
 
 ELAPSED=$(( $(date +%s) - START_EPOCH ))
 log "soak window done after ${ELAPSED}s (crashed=$CRASHED)"
 
-# --- 6. Pull the diagnostics log covering the whole run, whether or not it crashed.
-# Plain `log show` text, not --style ndjson: each line ends in
+# --- 6. Stop the diagnostics capture. Its lines end in
 # "[com.kagami.app:diagnostics] {json}" (confirmed against a real capture from this
-# same predicate), and the python step below just pulls the JSON tail off each line
-# rather than depending on ndjson's own wrapping.
-log "collecting diagnostics log"
-/usr/bin/log show --predicate 'subsystem == "com.kagami.app" AND category == "diagnostics"' \
-    --start "$LAUNCH_START_LOGSHOW" > "$DIAG_LOG" 2>/dev/null
+# predicate); the python step below just pulls the JSON tail off each line rather
+# than depending on `log stream`'s own text framing.
+log "stopping log stream capture"
+kill "$LOG_STREAM_PID" 2>/dev/null
+wait "$LOG_STREAM_PID" 2>/dev/null
 
 # --- 7. Tear down: terminate the app, kill the fake console. Never leave either
 #        running past this script, and never shut down the simulator here if we did
